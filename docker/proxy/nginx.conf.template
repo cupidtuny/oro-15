@@ -145,8 +145,12 @@ http {
         location /_chutes_proxy/ {
             internal;
 
-            # DNS resolution for external hostname (use Docker internal DNS)
-            resolver 127.0.0.11 valid=30s;
+            # Per-request DNS via a configurable resolver. Default points at
+            # the Docker-compose embedded resolver; environments without it
+            # (e.g. ECS Fargate) override via PROXY_RESOLVER to their own
+            # DNS (VPC resolver, public DNS, etc.). Keeps the variable
+            # proxy_pass so re-resolution happens on TTL expiry.
+            resolver ${PROXY_RESOLVER};
             set $chutes_upstream https://${CHUTES_HOST};
 
             # Strip /_chutes_proxy prefix and map to Chutes /v1/* API
@@ -173,10 +177,12 @@ http {
         location /_openrouter_proxy/ {
             internal;
 
-            # ipv6=off: openrouter.ai resolves to Cloudflare AAAA records the
-            # Docker bridge can't reach; without this nginx tries IPv6 first
-            # and every request fails with "Network unreachable".
-            resolver 127.0.0.11 ipv6=off valid=30s;
+            # Per-request DNS via the configurable resolver (see /_chutes_proxy/
+            # for the rationale). `ipv6=off` is required for openrouter.ai: it
+            # resolves to Cloudflare AAAA records that the Docker bridge can't
+            # reach, and without it every request fails with "Network
+            # unreachable".
+            resolver ${PROXY_RESOLVER} ipv6=off;
             set $openrouter_upstream https://${OPENROUTER_HOST};
 
             # Strip /_openrouter_proxy prefix and map to OpenRouter /api/v1/* API
