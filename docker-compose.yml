@@ -102,6 +102,8 @@ services:
       - ${HOME}/.bittensor/wallets:/root/.bittensor/wallets:ro
       - ./logs:/app/logs
       - validator-data:/root/.validator
+      # Drain-mode sentinel — host writes /drain, validator polls (ORO-1150).
+      - /var/run/oro-validator:/var/run/oro-validator
     environment:
       - DOCKER_CONTEXT=default
       - HOST_PROJECT_DIR=${PWD}

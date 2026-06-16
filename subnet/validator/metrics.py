@@ -28,6 +28,12 @@ CLAIM_WORK_TOTAL = Counter(
     labelnames=("result",),  # success | empty | error
 )
 
+DRAIN_TICKS_TOTAL = Counter(
+    "validator_drain_ticks_total",
+    "Main-loop ticks short-circuited by the drain sentinel (ORO-1150). "
+    "Separate from CLAIM_WORK_TOTAL so claim-success rate stays clean.",
+)
+
 SANDBOX_ACTIVE = Gauge(
     "validator_sandbox_active",
     "Sandbox containers currently running on this host",

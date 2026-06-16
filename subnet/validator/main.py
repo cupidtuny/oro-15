@@ -36,6 +36,7 @@ from .weight_setter import WeightSetterThread
 from .retry_queue import LocalRetryQueue
 from .progress_reporter import ProgressReporter
 from .backoff import ExponentialBackoff
+from .drain import handle_drain_tick
 from .models import CompletionRequest
 from subnet.sandbox import host_path, build_sandbox_command, SANDBOX_IMAGE
 
@@ -508,9 +509,20 @@ class Validator:
             f"Weight setter started (interval: {self.config.weight_update_interval}s)"
         )
 
+        self._drain_state: dict = {}
+
         try:
             while True:
                 try:
+                    # Drain check sits ABOVE auto-update so a Watchtower
+                    # image roll can't restart mid-drain (ORO-1150).
+                    if handle_drain_tick(
+                        self._drain_state,
+                        self.retry_queue,
+                        self.config.poll_interval,
+                    ):
+                        continue
+
                     # Check for image updates every 5 minutes
                     if time.time() - self._last_update_check >= UPDATE_CHECK_INTERVAL:
                         self._check_for_updates()

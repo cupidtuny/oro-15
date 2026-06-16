@@ -76,8 +76,13 @@ class LocalRetryQueue:
         data = self._load()
         return len(data["pending"])
 
-    def process_pending(self) -> None:
-        """Attempt to process all pending completions."""
+    def process_pending(self, *, count_attempts: bool = True) -> None:
+        """Attempt to process all pending completions.
+
+        ``count_attempts=False`` skips the retry-budget increment so a
+        multi-minute drain (ORO-1150) plus a coincident backend transient
+        can't permanently drop reports before instance termination.
+        """
         data = self._load()
         remaining = []
 
@@ -90,14 +95,15 @@ class LocalRetryQueue:
                 else:
                     logging.warning(f"Unknown entry type '{entry_type}', dropping")
             except _TransientRetry:
-                entry["retry_count"] += 1
-                if entry["retry_count"] >= self.max_retries:
-                    logging.error(
-                        f"Max retries ({self.max_retries}) exceeded for "
-                        f"{entry_type} {entry.get('eval_run_id')}, dropping"
-                    )
-                else:
-                    remaining.append(entry)
+                if count_attempts:
+                    entry["retry_count"] += 1
+                    if entry["retry_count"] >= self.max_retries:
+                        logging.error(
+                            f"Max retries ({self.max_retries}) exceeded for "
+                            f"{entry_type} {entry.get('eval_run_id')}, dropping"
+                        )
+                        continue
+                remaining.append(entry)
 
         data["pending"] = remaining
         self._save(data)
