@@ -890,10 +890,6 @@ def _elect_best_slice_cap(candidates: list, max_candidates: int) -> list:
     cap = max(1, min(int(max_candidates), 60))
     return candidates[:cap]
 
-def _elect_best_judge_user_json(query_text: str, slice_c: list, details: dict[str, dict], only_product_type: bool) -> str:
-    bundle = {'request': query_text, 'candidates': [_build_candidate(p, details.get(str(p.get('product_id', ''))), query_text) for p in slice_c], 'only_product_type': only_product_type}
-    return json.dumps(bundle, ensure_ascii=False)
-
 def _elect_best_dispatch_post(model_name: str, user_content: str) -> dict | None:
     result = _llm_transport.post('/inference/chat/completions', json_data={'model': model_name, 'temperature': 0.5, 'stream': False, 'messages': [{'role': 'system', 'content': RazgrizPrompts.ITEM_JUDGE}, {'role': 'user', 'content': user_content}]})
     return result if result and result.get('choices') else None
@@ -940,7 +936,7 @@ def _elect_best(query_text: str, candidates: list, details: dict[str, dict], onl
     if _budget_sec_left() < 35.0:
         return None
     slice_c = _elect_best_slice_cap(candidates, max_candidates)
-    user_content = _elect_best_judge_user_json(query_text, slice_c, details, only_product_type)
+    user_content = _batch_scorer_user_json(query_text, slice_c, details, only_product_type)
     for model_name in _elect_model_seq():
         winner = _elect_best_attempt_cycle(model_name, user_content, slice_c, details, query_text)
         if winner is not None:
@@ -1085,9 +1081,6 @@ def _search_spec_in_shop_limited(spec: SpecEntry, shop_id: str, *, page: int=1, 
     deduped = _SearchParamSanitizer.deduplicate(batch or [])
     return deduped[:limit]
 
-def _ranked_shop_ids_from_pairs(spec_pairs: list[tuple[ListingRow, float]], max_shops: int) -> list[str]:
-    return _top_shop_ids_by_score(spec_pairs, max_shops)
-
 def _top_shop_ids_by_score(spec_pairs: list[tuple[ListingRow, float]], k: int) -> list[str]:
     best_by_shop: dict[str, float] = {}
     for prod, sc in spec_pairs:
@@ -1137,9 +1130,6 @@ def _dedupe_spec_pairs_by_shop(pairs: list[tuple[ListingRow, float]]) -> list[tu
         if current is None or float(sc) > current[1]:
             best_by_shop[sid] = (prod, float(sc))
     return list(best_by_shop.values())
-
-def _two_spec_top_shop_ids(spec_pairs: list[tuple[ListingRow, float]], k: int) -> list[str]:
-    return _top_shop_ids_by_score(spec_pairs, k)
 
 def _gather_cross_spec_pool_in_shops(spec: SpecEntry, shop_ids: list[str], cap: int) -> list[ListingRow]:
     if not shop_ids or cap <= 0:
@@ -2237,9 +2227,6 @@ def _pipe_weigh_multi(ctx, leaders: list, pools: list, specs: list, n_alts: int=
         fb_parts.append(f"Spec[{e['spec_idx']}] '{e['keywords']}': leader pid={e['leader']['product_id']} price={e['leader']['price']} score={e['leader']['heuristic_score']}; alternatives: {alts_fmt}.{prefer}")
     _pipe_append_step(ctx, ' '.join(fb_parts), [])
 
-def _pipe_two_spec_resolve(ctx, specs: list[SpecEntry], spec_scored: list[list[tuple[ListingRow, float]]], cand_ids_by_spec: list[list[str]], all_cand_ids: list[str], voucher_budget: tuple[float, float] | None=None) -> _ShopResult | None:
-    return _pipe_bidir_two_spec_resolve(ctx, specs, spec_scored, cand_ids_by_spec, all_cand_ids, voucher_budget=voucher_budget)
-
 def _pipe_bidir_two_spec_resolve(ctx, specs: list[SpecEntry], spec_scored: list[list[tuple[ListingRow, float]]], cand_ids_by_spec: list[list[str]], all_cand_ids: list[str], voucher_budget: tuple[float, float] | None=None) -> _ShopResult | None:
     if len(specs) != 2:
         return None
@@ -2255,13 +2242,13 @@ def _pipe_bidir_two_spec_resolve(ctx, specs: list[SpecEntry], spec_scored: list[
         anchor_spec = specs[anchor_idx]
         other_spec = specs[other_idx]
         pairs_a = spec_scored[anchor_idx]
-        ranked_upto6 = _ranked_shop_ids_from_pairs(pairs_a, 6)
+        ranked_upto6 = _top_shop_ids_by_score(pairs_a, 6)
         if voucher_budget is not None:
             shop_attempts: list[list[str]] = [ranked_upto6[:TWO_SPEC_TOP_SHOPS]]
             if len(ranked_upto6) >= 6:
                 shop_attempts.append(ranked_upto6[:6])
         else:
-            sid_list = _two_spec_top_shop_ids(pairs_a, TWO_SPEC_TOP_SHOPS)
+            sid_list = _top_shop_ids_by_score(pairs_a, TWO_SPEC_TOP_SHOPS)
             if not sid_list:
                 return None
             shop_attempts = [sid_list]
@@ -2381,7 +2368,7 @@ def _pipe_three_spec_resolve(ctx, specs: list[SpecEntry], spec_scored: list[list
         spec_scored = list(spec_scored[:3])
     deduped = [_dedupe_spec_pairs_by_shop(spec_scored[i]) for i in range(3)]
     score_maps = [{str(p.get('product_id') or '').strip(): float(sc) for p, sc in deduped[i]} for i in range(3)]
-    ranked = [_ranked_shop_ids_from_pairs(deduped[i], 12) for i in range(3)]
+    ranked = [_top_shop_ids_by_score(deduped[i], 12) for i in range(3)]
     scored_idxs = [i for i in range(3) if ranked[i]]
     if not scored_idxs:
         return None
@@ -2778,7 +2765,7 @@ def _pipe_process_shop_query(ctx, params: dict) -> _ShopResult | None:
     if not full_shops:
         spec_scored_case_c = _filter_spec_floor(spec_scored, TWO_SPEC_SCORE_FLOOR)
         if n_specs == 2:
-            pair_res = _pipe_two_spec_resolve(ctx, specs, spec_scored_case_c, cand_ids_by_spec, all_cand_ids, voucher_budget=voucher_budget)
+            pair_res = _pipe_bidir_two_spec_resolve(ctx, specs, spec_scored_case_c, cand_ids_by_spec, all_cand_ids, voucher_budget=voucher_budget)
             if pair_res is not None:
                 return pair_res
         if n_specs == 3:
@@ -3474,7 +3461,7 @@ class P50_SingleProductRecommendationFlow:
     def stage_finalize_successful_recommendation(self) -> None:
         pid = str(self.best.get('product_id', '') or '')
         P50_append_single_product_alternatives_step(self.ctx, self.best, self.unique, self.spec)
-        constraint_check = P50_audit_selected_listing_against_spec(title=self.best.get('title', ''), price=self.best.get('price'), parsed_spec=self.spec)
+        constraint_check = _verify_pick(title=self.best.get('title', ''), price=self.best.get('price'), parsed_spec=self.spec)
         final_alts = P50_top_alternate_listings_for_narration(self.best, self.unique, self.spec, self.ctx.query, n=2, with_title=True)
         compare_clause = P50_format_single_product_comparison_clause(self.best, final_alts, self.ctx.query, self.spec)
         llm_reason = str(self.best.get('_llm_reason', '') or '').strip()
@@ -3518,21 +3505,13 @@ def P50_read_thread_local_http_journal_events() -> list[dict]:
     setattr(P50_thread_local_http_journal_buffer, 'events', fresh)
     return fresh
 
-def P50_parse_completion_token_usage_from_body(response: Any) -> tuple[int | None, dict | None]:
-    if not isinstance(response, dict):
-        return (None, None)
-    usage_block = response.get('usage')
-    if not isinstance(usage_block, dict):
-        return (None, None)
-    return (usage_block.get('completion_tokens'), usage_block)
-
 def P50_parse_product_ids_from_catalog_response(path: str, response: Any) -> list[str]:
     if P50_CATALOG_FIND_PRODUCT_API_PATH not in path or not isinstance(response, list):
         return []
     return [str(rec['product_id']) for rec in response if isinstance(rec, dict) and rec.get('product_id')]
 
 def P50_append_http_roundtrip_journal_event(kind: str, method: str, path: str, elapsed_ms: float, response: Any, params: Any=None, json_data: Any=None) -> None:
-    completion_tokens, usage_block = P50_parse_completion_token_usage_from_body(response)
+    completion_tokens, usage_block = _acl_extract_usage(response)
     ts = time.time()
     event: dict = {'kind': kind, 'method': method, 'path': path, 'duration_ms': round(elapsed_ms, 1), 'completion_tokens': completion_tokens, 'status_code': 200 if isinstance(response, (dict, list)) else None, 'timestamp': int(ts * 1000), 't': ts}
     if isinstance(params, dict) and params:
@@ -3585,12 +3564,6 @@ def P50_invoke_sandbox_tool_with_gap_and_retry(tool_name: str, params: dict) -> 
             wait_secs = P50_SANDBOX_TOOL_RETRY_BACKOFF_BASE_SECONDS * 2 ** (attempt_idx - 1)
             time.sleep(wait_secs)
 
-def P50_parse_optional_float_from_text(text: str) -> float | None:
-    try:
-        return float(text)
-    except (ValueError, TypeError):
-        return None
-
 def P50_normalize_catalog_service_csv_filter(service: str | None) -> str | None:
     if not service:
         return service
@@ -3599,25 +3572,16 @@ def P50_normalize_catalog_service_csv_filter(service: str | None) -> str | None:
     parts = [p.strip() for p in service.split(',') if p.strip() and p.strip() != 'default']
     return ','.join(parts) or None
 
-def P50_parse_hyphenated_price_range_bounds(price_range: str) -> tuple:
-    if not price_range or not isinstance(price_range, str):
-        return (None, None)
-    left_raw, sep, right_raw = price_range.partition('-')
-    if not sep:
-        return (None, None)
-    left, right = (left_raw.strip(), right_raw.strip())
-    return (P50_parse_optional_float_from_text(left) if left else None, P50_parse_optional_float_from_text(right) if right else None)
-
 def P50_parse_optional_price_range_to_float_bounds(price_range: str | None) -> tuple[float | None, float | None]:
     if not price_range:
         return (None, None)
     s = str(price_range).strip()
     if '-' not in s:
-        v = P50_parse_optional_float_from_text(s)
+        v = _float_or_none(s)
         return (None, v) if v is not None else (None, None)
     sep_idx = s.index('-')
     lo_part, hi_part = (s[:sep_idx].strip(), s[sep_idx + 1:].strip())
-    return (P50_parse_optional_float_from_text(lo_part) if lo_part else None, P50_parse_optional_float_from_text(hi_part) if hi_part else None)
+    return (_float_or_none(lo_part) if lo_part else None, _float_or_none(hi_part) if hi_part else None)
 
 def P50_strip_stopwords_from_search_keywords(text: str | None) -> str:
     if not text:
@@ -3709,26 +3673,6 @@ def P50_merge_find_product_into_candidate_pool(result: dict, unique: list[dict],
             seen.add(pid)
             unique.append(prod)
 
-def P50_flatten_listing_and_detail_to_search_text(product: dict, detail: dict | None) -> str:
-    fragments = [(product.get('title') or '').lower()]
-    if isinstance(detail, dict):
-        attrs = detail.get('attributes') or {}
-        if isinstance(attrs, dict):
-            for k, vs in attrs.items():
-                fragments.append(str(k).lower().replace('_', ' '))
-                if isinstance(vs, list):
-                    fragments.extend((str(v).lower() for v in vs))
-                else:
-                    fragments.append(str(vs).lower())
-        skus = detail.get('sku_options') or {}
-        if isinstance(skus, dict):
-            for opts in skus.values():
-                if isinstance(opts, dict):
-                    for k, v in opts.items():
-                        fragments.append(str(k).lower().replace('_', ' '))
-                        fragments.append(str(v).lower())
-    return ' '.join(fragments)
-
 def P50_compact_listings_for_dialogue_trace(items: list) -> list:
     return [{'pid': str(item.get('product_id', '')), 'p': item.get('price'), 's': str(item.get('shop_id', ''))} for item in items[:P50_DIALOGUE_TOOL_RESULT_LISTING_CAP] if isinstance(item, dict)]
 
@@ -3773,16 +3717,13 @@ def P50_query_token_matches_title_word_directly(word: str, title_words: set[str]
         return False
     return any((cand.startswith(word) for cand in title_words if len(cand) > len(word)))
 
-def P50_query_token_partially_matches_title_word(word: str, title_words: set[str]) -> bool:
-    return any((word.startswith(tw) or tw.startswith(word) for tw in title_words if len(tw) > 2))
-
 def P50_title_match_score(query_words: list[str], title_words: set[str], title: str) -> float:
     score = 0.0
     title_score = 0.0
     for w in query_words:
         if P50_query_token_matches_title_word_directly(w, title_words):
             score += 2.0
-        elif P50_query_token_partially_matches_title_word(w, title_words):
+        elif _is_title_partial_match(w, title_words):
             score += 1.0
         elif any((ch.isdigit() for ch in w)) and w in title:
             score += 2.0
@@ -3795,47 +3736,11 @@ def P50_score_title_token_overlap(query_words: list[str], title_words: set[str],
     for w in query_words:
         if P50_query_token_matches_title_word_directly(w, title_words):
             score += 2
-        elif P50_query_token_partially_matches_title_word(w, title_words):
+        elif _is_title_partial_match(w, title_words):
             score += 1
         if any((ch.isdigit() for ch in w)) and w in title:
             score += 2
     return score
-
-def P50_iterate_flat_attribute_pairs_from_detail(detail: P50_CatalogListingDict):
-    for key, vals in (detail.get('attributes') or {}).items():
-        yield (key, vals)
-    for opts in (detail.get('sku_options') or {}).values():
-        if isinstance(opts, dict):
-            yield from opts.items()
-
-def P50_flatten_detail_to_lowercase_text_and_tokens(detail: P50_CatalogListingDict) -> tuple[str, set[str]]:
-    tokens: list[str] = []
-    exact_vals: set[str] = set()
-    for key, values in (detail.get('attributes') or {}).items():
-        tokens.append(key.replace('_', ' '))
-        for value in values if isinstance(values, list) else [values]:
-            text = str(value).strip().lower()
-            tokens.append(text)
-            exact_vals.add(text)
-    sku_probe = {'attributes': {}, 'sku_options': detail.get('sku_options') or {}}
-    for key, value in P50_iterate_flat_attribute_pairs_from_detail(sku_probe):
-        text = str(value).strip().lower()
-        tokens.extend((key.replace('_', ' '), text))
-        exact_vals.add(text)
-    return (' '.join(tokens).lower(), exact_vals)
-
-def P50_score_attribute_text_overlap(query_words: list[str], detail: dict) -> float:
-    detail_text, exact_vals = P50_flatten_detail_to_lowercase_text_and_tokens(detail)
-    detail_words = set(re.findall('\\b\\w+\\b', detail_text))
-    total = 0.0
-    for w in query_words:
-        if f'{w}#' in exact_vals:
-            total += 5
-        elif w in exact_vals:
-            total += 3
-        elif w in detail_words:
-            total += 2
-    return total
 
 def P50_case_sensitive_attribute_score(query_words: list[str], detail: dict, a_coe: float, sku_coe: float) -> float:
     sku_words: dict[str, str] = {}
@@ -3868,7 +3773,7 @@ def P50_heuristic_listing_relevance_score(product: P50_CatalogListingDict, query
     qw = P50_tokenize_query_for_relevance_scoring(query_text)
     score = P50_score_title_token_overlap(qw, title_words, title)
     if detail:
-        score += P50_score_attribute_text_overlap(qw, detail)
+        score += _attr_score(qw, detail)
     return score
 
 def P50_composite_score(product: dict, query_text: str, detail: dict=None, parsed_spec: dict=None) -> float:
@@ -3900,7 +3805,7 @@ def P50_composite_score(product: dict, query_text: str, detail: dict=None, parse
     price_range_str = spec.get('price_range')
     price_score = 0.0
     if isinstance(price_val, (int, float)) and price_range_str:
-        lo, hi = P50_parse_hyphenated_price_range_bounds(price_range_str)
+        lo, hi = _parse_price_str(price_range_str)
         outside = lo is not None and price_val < lo or (hi is not None and price_val > hi)
         if outside:
             price_score = 0
@@ -3936,55 +3841,6 @@ def P50_coerce_value_to_optional_float(v: Any) -> float | None:
         return float(v) if v is not None else None
     except (TypeError, ValueError):
         return None
-
-def P50_parse_json_object_from_llm_content(content: str) -> dict | None:
-    cleaned = re.sub('<think(?:ing)?>.*?</think(?:ing)?>', '', content, flags=re.DOTALL | re.IGNORECASE)
-    cleaned = re.sub('<reasoning>.*?</reasoning>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
-    cleaned = re.sub('```json?\\s*|```\\s*', '', cleaned).strip()
-    try:
-        out = json.loads(cleaned)
-        if isinstance(out, dict):
-            return out
-    except json.JSONDecodeError:
-        pass
-    start = cleaned.find('{')
-    if start != -1:
-        depth = 0
-        in_str = False
-        escape_next = False
-        for i, ch in enumerate(cleaned[start:], start):
-            if escape_next:
-                escape_next = False
-                continue
-            if ch == '\\' and in_str:
-                escape_next = True
-                continue
-            if ch == '"':
-                in_str = not in_str
-                continue
-            if in_str:
-                continue
-            if ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0:
-                    candidate = cleaned[start:i + 1]
-                    try:
-                        out = json.loads(candidate)
-                        if isinstance(out, dict):
-                            return out
-                    except json.JSONDecodeError:
-                        break
-    brace_match = re.search('\\{.*\\}', content, re.DOTALL)
-    if brace_match:
-        try:
-            out = json.loads(brace_match.group())
-            if isinstance(out, dict):
-                return out
-        except json.JSONDecodeError:
-            pass
-    return None
 
 def P50_truncate_strings_in_nested_json(value: Any, max_len: int) -> Any:
     if isinstance(value, str):
@@ -4080,7 +3936,7 @@ def P50_llm_elect_best_listing_from_pool(query_text: str, candidates: list, deta
             if not (result and result.get('choices')):
                 continue
             content = result['choices'][0].get('message', {}).get('content', '')
-            parsed = P50_parse_json_object_from_llm_content(content)
+            parsed = _parse_json_str(content)
             if not isinstance(parsed, dict):
                 continue
             best_pid = str(parsed.get('best_product_id', '') or '').strip()
@@ -4137,7 +3993,7 @@ def P50_llm_elect_best_listing_with_self_consistency(query_text: str, candidates
     return first if s1 >= s2 else second
 
 def P50_find_ungrounded_terms_in_llm_reason(reason: str, product: dict, detail: dict | None, query_text: str) -> tuple[bool, list[str]]:
-    haystack = P50_flatten_listing_and_detail_to_search_text(product, detail)
+    haystack = _product_detail_text(product, detail)
     query_terms = {w for w in re.findall('\\b\\w{4,}\\b', (query_text or '').lower()) if w not in P50_RELEVANCE_SCORING_STOPWORDS}
     if not query_terms:
         return (True, [])
@@ -4174,7 +4030,7 @@ def P50_parse_llm_parameter_json_or_none(result: dict, task_type: str) -> dict |
     if not result or not result.get('choices'):
         return None
     content = result['choices'][0].get('message', {}).get('content', '')
-    parsed = P50_parse_json_object_from_llm_content(content)
+    parsed = _parse_json_str(content)
     if parsed is None:
         return None
     if task_type == 'product':
@@ -4182,42 +4038,6 @@ def P50_parse_llm_parameter_json_or_none(result: dict, task_type: str) -> dict |
     if task_type == 'shop':
         return P50_normalize_keywords_for_shop_mode_parse(parsed)
     return parsed
-
-def P50_audit_selected_listing_against_spec(*, title: str, price: Any, parsed_spec: dict) -> dict:
-    title_lower = (title or '').lower()
-    spec = parsed_spec or {}
-    kw = [w for w in str(spec.get('keywords', '') or '').lower().split() if w]
-    matched = [w for w in kw if w in title_lower]
-    missing = [w for w in kw if w not in title_lower]
-    price_ok: bool | None = None
-    price_note = 'no price range was parsed from the query'
-    price_range = spec.get('price_range')
-    if price_range:
-        try:
-            lo, hi = P50_parse_hyphenated_price_range_bounds(str(price_range))
-            if price is None:
-                price_note = f'no price available to compare against range {price_range}'
-            else:
-                pv = float(price)
-                if lo is not None and pv < lo:
-                    price_ok, price_note = (False, f'price {pv} is BELOW lower bound {lo} of range {price_range}')
-                elif hi is not None and pv > hi:
-                    price_ok, price_note = (False, f'price {pv} is ABOVE upper bound {hi} of range {price_range}')
-                else:
-                    price_ok, price_note = (True, f'price {pv} fits inside range {price_range}')
-        except (TypeError, ValueError):
-            price_note = f'price {price!r} is not numeric; could not check range {price_range}'
-    has_missing = bool(missing)
-    price_bad = price_ok is False
-    if not has_missing and (not price_bad):
-        note = 'The selected product looks like a genuine match for the parsed query.'
-    elif has_missing and price_bad:
-        note = f'HONEST MISMATCH: title is missing query terms {missing} and price is outside the requested range. This is the best available candidate, not a clean fit.'
-    elif has_missing:
-        note = f'HONEST MISMATCH: the selected title is missing query terms {missing}; attributes may still confirm the fit, but the title alone is imperfect.'
-    else:
-        note = 'HONEST MISMATCH: title matches the keywords but the price does not fit the requested range. Taking it as the closest available option.'
-    return {'query_keywords': kw, 'keywords_matched': matched, 'keywords_missing': missing, 'title_contains_all_keywords': not has_missing, 'price_ok': price_ok, 'price_note': price_note, 'overall_note': note}
 
 def P50_build_leader_vs_alternate_reason(leader: dict, alt: dict, query: str='', spec: dict | None=None) -> str:
     spec = spec or {}
@@ -4298,20 +4118,8 @@ def P50_top_alternate_listings_for_narration(leader: dict | None, pool: list, sp
 P50__RICHNESS_RANK_SENTINEL = 10000
 
 def P50_parsed_spec_richness_rank_for_tiebreak(spec: P50_ParsedProductSpecDict) -> int:
-    rank = P50_parse_product_order_rank_integer(spec.get('order'))
+    rank = _to_rank_int(spec.get('order'))
     return P50__RICHNESS_RANK_SENTINEL if rank is None else rank
-
-def P50_parse_product_order_rank_integer(value: object) -> int | None:
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        n = int(value)
-        return n if n >= 1 else None
-    text = str(value).strip().lower()
-    if not text:
-        return None
-    m = re.match('^(\\d+)', text)
-    return int(m.group(1)) if m else None
 
 def P50_index_of_most_information_rich_spec(spec_indices: list[int], specs: list[P50_ParsedProductSpecDict]) -> int:
 
@@ -4390,19 +4198,11 @@ def P50_extract_price_range_phrase_from_query(text: str) -> str | None:
             return f'{range_match2.group(1)}-{range_match2.group(2)}'
     return None
 
-def P50_extract_service_tags_csv_from_query(text_lower: str) -> str | None:
-    svc_parts: list[str] = []
-    service_signals = [('official', ('lazmall', 'official')), ('freeShipping', ('free shipping', 'free delivery')), ('flashsale', ('lazflash', 'flash sale', 'flashsale')), ('COD', ('cash on delivery', 'cod'))]
-    for svc_name, markers in service_signals:
-        if any((marker in text_lower for marker in markers)):
-            svc_parts.append(svc_name)
-    return ','.join(svc_parts) if svc_parts else None
-
 def P50_regex_extract_lightweight_product_spec(text: str) -> dict:
     text_lower = text.lower()
     kw_tokens = P50_extract_keyword_tokens_from_query(text)
     keywords = ' '.join(kw_tokens) or 'product'
-    return {'keywords': keywords, 'price_range': P50_extract_price_range_phrase_from_query(text), 'service': P50_extract_service_tags_csv_from_query(text_lower)}
+    return {'keywords': keywords, 'price_range': P50_extract_price_range_phrase_from_query(text), 'service': _extract_service_flags(text_lower)}
 
 def P50_build_regex_fallback_parameter_snapshot(query: str) -> dict:
     task_type = P50_classify_shopping_task_kind_from_query(query)
