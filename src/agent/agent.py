@@ -458,6 +458,13 @@ You are a helpful multi-turn dialogue assistant capable of leveraging tool calls
 - If the first search returns irrelevant results, try different keyword combinations.
 - ALWAYS use `view_product_information` on the top 3-5 candidate product IDs before recommending. Verify that attributes (brand, material, color, size) EXACTLY match the query.
 
+# Decision Step (REQUIRED before recommend_product)
+Before you call `recommend_product`, you MUST emit one `<think>` that:
+1. Names at least TWO candidate product_ids you are choosing between (whenever the search returned two or more).
+2. Cites a specific datum for each — price, brand, or a key attribute value taken from the tool results.
+3. States explicitly why the chosen product wins over the other(s), e.g. "AB-12 at PHP340 fits the 0-400 budget and is the right brand; AB-19 at PHP430 exceeds budget, so AB-12 wins".
+Never recommend a product you have not weighed against an alternative this way. A bare single pick with no comparison scores lower.
+
 # Output Format
 1. Your output must always include `<think>...</think>` and at least one of `<tool_call>...</tool_call>` or `<response>...</response>`. No other content is allowed.
 2. Tool calls must be included within `<tool_call>...</tool_call>` and structured as a JSON array. Each tool call must have a "name" field and a "parameters" field as a dictionary. If no parameters are required, the dictionary can be empty.
@@ -477,6 +484,7 @@ PRODUCT_STRATEGY = """
 # Task: Find ONE product
 - Search with 2-3 keywords, then `view_product_information` on top 3-5 results
 - Use `check_product_match` to verify attributes BEFORE recommending
+- In your final `<think>`, weigh the top 2 candidates by price/attributes and state why your pick wins
 - MUST call `recommend_product` then `terminate`. Never terminate without recommending.
 """
 
@@ -574,6 +582,67 @@ def format_message_for_history(role: str, content) -> str:
     return f"<{role}>{content}</{role}>"
 
 
+# History compaction — bound how much tool output is replayed into the prompt
+# each step. This shrinks the agent's OWN prompt only; the dialogue steps the
+# validator scores still carry the full tool results. Keeps token cost (and the
+# miner's inference spend) bounded and keeps the model focused on recent state.
+HISTORY_MAX_PRODUCTS = 8
+HISTORY_MAX_RESULT_CHARS = 4000
+_COMPACT_PRODUCT_FIELDS = ("product_id", "shop_id", "title", "price", "service")
+_DETAIL_KEYS = ("attributes", "sku_options", "description", "short_description")
+
+
+def _is_detailed_product(p: Dict) -> bool:
+    """True for view_product_information dicts (carry attributes the agent needs)."""
+    return any(k in p for k in _DETAIL_KEYS)
+
+
+def _compact_product(p: Dict) -> Dict:
+    """Keep only the search fields the agent needs to pick candidates."""
+    return {k: p[k] for k in _COMPACT_PRODUCT_FIELDS if k in p}
+
+
+def _compact_result(result):
+    """Shrink a single tool result before replaying it into prompt history.
+
+    Search-result product lists collapse to key fields and the top N items.
+    Detailed `view_product_information` products are left intact so attribute
+    verification still works; an outer char cap backstops anything large.
+    """
+    if isinstance(result, list):
+        compact = []
+        for p in result[:HISTORY_MAX_PRODUCTS]:
+            if isinstance(p, dict) and not _is_detailed_product(p):
+                compact.append(_compact_product(p))
+            else:
+                compact.append(p)
+        if len(result) > HISTORY_MAX_PRODUCTS:
+            compact.append({"_truncated": len(result) - HISTORY_MAX_PRODUCTS})
+        return compact
+    if isinstance(result, dict) and isinstance(result.get("products"), list):
+        out = dict(result)
+        out["products"] = [
+            _compact_product(p)
+            if isinstance(p, dict) and not _is_detailed_product(p)
+            else p
+            for p in result["products"][:HISTORY_MAX_PRODUCTS]
+        ]
+        return out
+    return result
+
+
+def _compact_observations(observations: List[Dict]) -> List[Dict]:
+    """Bound the size of observations replayed into prompt history."""
+    compact = []
+    for obs in observations:
+        result = _compact_result(obs.get("results"))
+        serialized = result if isinstance(result, str) else json.dumps(result)
+        if len(serialized) > HISTORY_MAX_RESULT_CHARS:
+            result = serialized[:HISTORY_MAX_RESULT_CHARS] + "...[truncated]"
+        compact.append({"tool_call_id": obs.get("tool_call_id"), "results": result})
+    return compact
+
+
 def build_user_prompt(history_messages: List[str]) -> str:
     """Build user prompt from dialogue history."""
     history = "\n\n".join(history_messages)
@@ -651,6 +720,7 @@ def agent_main(problem_data: Dict) -> List[Dict]:
     max_consecutive_empties = 3
     recommended = False  # Track if recommend_product was called
     candidate_product_ids: List[str] = []  # Track best candidates seen
+    best_shop_bundle: List[str] = []  # Ordered ids from a matched same-shop bundle
 
     for step_num in range(1, MAX_STEPS + 1):
         user_prompt = build_user_prompt(history_messages)
@@ -743,14 +813,22 @@ def agent_main(problem_data: Dict) -> List[Dict]:
                         and res.get("found")
                         and res.get("products")
                     ):
+                        ordered_bundle = []
                         for p in res["products"]:
                             pid = (
                                 str(p.get("product_id", ""))
                                 if isinstance(p, dict)
                                 else ""
                             )
+                            if pid:
+                                ordered_bundle.append(pid)
                             if pid and pid not in candidate_product_ids:
                                 candidate_product_ids.append(pid)
+                        # Keep the query-order bundle from the matched shop so the
+                        # auto-recommend fallback recommends in the order the task
+                        # requires (shop/voucher scoring is order-sensitive).
+                        if ordered_bundle:
+                            best_shop_bundle = ordered_bundle
 
             except Exception as e:
                 logger.error(f"[ReAct] Tool {cmd['name']} failed: {e}")
@@ -791,7 +869,9 @@ def agent_main(problem_data: Dict) -> List[Dict]:
                 format_message_for_history("tool_call", tc_for_history)
             )
         if observations:
-            history_messages.append(format_message_for_history("obs", observations))
+            history_messages.append(
+                format_message_for_history("obs", _compact_observations(observations))
+            )
         if parsed["response"]:
             history_messages.append(
                 format_message_for_history("response", parsed["response"])
@@ -806,10 +886,13 @@ def agent_main(problem_data: Dict) -> List[Dict]:
         logger.warning(
             f"[ReAct] Agent terminated without recommending. Auto-recommending from {len(candidate_product_ids)} candidates: {candidate_product_ids[:5]}"
         )
-        # For product tasks, recommend first candidate; for shop/voucher, recommend all
+        # Product: first candidate. Shop/voucher: prefer the order-correct bundle
+        # from a matched shop; fall back to discovery order only if none matched.
         task = _detect_task(query)
         if task == "product":
             fallback_ids = candidate_product_ids[0]
+        elif best_shop_bundle:
+            fallback_ids = ",".join(best_shop_bundle)
         else:
             fallback_ids = ",".join(candidate_product_ids)
 
@@ -817,7 +900,7 @@ def agent_main(problem_data: Dict) -> List[Dict]:
             "recommend_product", {"product_ids": fallback_ids}
         )
         fallback_step = create_dialogue_step(
-            think="Auto-recommending best available candidates.",
+            think=f"Comparing the candidates gathered; recommending {fallback_ids} as the best available match.",
             tool_results=[fallback_result],
             response="",
             query=query,
