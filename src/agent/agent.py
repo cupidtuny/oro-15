@@ -405,13 +405,10 @@ class _TracedProxy:
 
     def get(self, path: str, params=None, **kw):
         return self._roundtrip('GET', path, params=params, **kw)
-# Resilient but bounded against the 300s per-problem sandbox kill. Keep 5 retries so
-# fast transient failures (connection resets, 429s) recover as before, and a 90s
-# per-call timeout that never truncates a healthy call (normal inference <10s). The
-# `max_total_seconds` cap stops a HUNG provider from retrying into the kill: ~2 full
-# 90s attempts (~185s) then it gives up and `post` returns None, so the agent falls
-# through to a best-effort finalize instead of dying at 0.
-_llm_transport = _TracedProxy(ProxyClient(timeout=90, max_retries=5, max_total_seconds=180), 'inference')
+# IMPORTANT: only pass params the harness ProxyClient accepts (timeout, max_retries).
+# `src/agent/proxy_client.py` is baked into the sandbox image, so a kwarg the baked
+# version lacks crashes agent import on EVERY problem. Known-good original config.
+_llm_transport = _TracedProxy(ProxyClient(timeout=120, max_retries=5), 'inference')
 _search_transport = _TracedProxy(ProxyClient(timeout=30, max_retries=3), 'search')
 
 def _rate_limited_search_get(path: str, params: dict | None=None):
