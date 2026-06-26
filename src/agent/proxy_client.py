@@ -166,6 +166,7 @@ class ProxyClient:
         retry_delay: float = DEFAULT_RETRY_DELAY,
         rate_limit_retry_delay: float = DEFAULT_RATE_LIMIT_RETRY_DELAY,
         api_key: Optional[str] = None,
+        max_total_seconds: Optional[float] = None,
     ):
         """
         Initialize the proxy client.
@@ -183,6 +184,10 @@ class ProxyClient:
         self.proxy_url = proxy_url or os.getenv("SANDBOX_PROXY_URL", "http://proxy:80")
         self.timeout = timeout
         self.max_retries = max_retries
+        # Optional cap on cumulative retry time. Fast failures still exhaust
+        # max_retries cheaply, but a hung provider stops retrying before this
+        # bound so one call can't blow the per-problem sandbox kill (300s).
+        self.max_total_seconds = max_total_seconds
         self.retry_delay = retry_delay
         self.rate_limit_retry_delay = rate_limit_retry_delay
         self.api_key = api_key or os.getenv("CHUTES_ACCESS_TOKEN")
@@ -242,7 +247,18 @@ class ProxyClient:
             Response object if successful, None otherwise
         """
         operation_name = f"{method} {path}"
+        loop_t0 = time.monotonic()
         for i in range(self.max_retries):
+            if (
+                i > 0
+                and self.max_total_seconds is not None
+                and (time.monotonic() - loop_t0) >= self.max_total_seconds
+            ):
+                logger.warning(
+                    f"{operation_name} aborting retries after "
+                    f"{time.monotonic() - loop_t0:.0f}s (cap {self.max_total_seconds:.0f}s)"
+                )
+                break
             attempt_t0 = time.monotonic()
             status_code: Optional[int] = None
             error_class: Optional[str] = None
@@ -290,6 +306,11 @@ class ProxyClient:
                     self.rate_limit_retry_delay if is_rate_limited else self.retry_delay
                 )
                 delay = min(base_delay * (2**i), 10)
+                if (
+                    self.max_total_seconds is not None
+                    and (time.monotonic() - loop_t0) + delay >= self.max_total_seconds
+                ):
+                    break
                 time.sleep(delay)
 
         logger.error(f"Failed {operation_name} after {self.max_retries} retries")

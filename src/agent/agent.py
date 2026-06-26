@@ -405,12 +405,13 @@ class _TracedProxy:
 
     def get(self, path: str, params=None, **kw):
         return self._roundtrip('GET', path, params=params, **kw)
-# timeout/max_retries are bounded against the 300s per-problem sandbox kill: a hung
-# provider at the old 120s*5 (~640s) guaranteed a kill (0 on every metric), whereas
-# `post` returns None on exhaustion so the agent can fall through to a best-effort
-# finalize. 75s*3 (~245s worst case) leaves headroom to finalize; normal inference
-# calls return in <10s so this never truncates a healthy call.
-_llm_transport = _TracedProxy(ProxyClient(timeout=75, max_retries=3), 'inference')
+# Resilient but bounded against the 300s per-problem sandbox kill. Keep 5 retries so
+# fast transient failures (connection resets, 429s) recover as before, and a 90s
+# per-call timeout that never truncates a healthy call (normal inference <10s). The
+# `max_total_seconds` cap stops a HUNG provider from retrying into the kill: ~2 full
+# 90s attempts (~185s) then it gives up and `post` returns None, so the agent falls
+# through to a best-effort finalize instead of dying at 0.
+_llm_transport = _TracedProxy(ProxyClient(timeout=90, max_retries=5, max_total_seconds=180), 'inference')
 _search_transport = _TracedProxy(ProxyClient(timeout=30, max_retries=3), 'search')
 
 def _rate_limited_search_get(path: str, params: dict | None=None):
@@ -1902,18 +1903,69 @@ def _route_task_kind(query: str) -> str:
         return 'shop'
     return 'product'
 
+_RX_PRICE_NUM = r'`?(\d[\d,]*(?:\.\d+)?)'
+
+def _rx_price_int(raw: str) -> str:
+    """Normalise a captured price token: strip commas/backticks, drop decimals."""
+    s = str(raw).replace(',', '').replace('`', '').strip()
+    try:
+        return str(int(float(s)))
+    except (TypeError, ValueError):
+        return s
+
 def _extract_price_range(text: str) -> str | None:
-    price_match = re.search('(?:greater|more|over|above|>|cost[s]?\\s+more)\\s*(?:than\\s*)?(\\d+)', text, re.I)
-    if price_match:
-        return f'{price_match.group(1)}-'
-    range_match = re.search('(\\d{1,6})\\s*(?:to|and|-)\\s*(\\d{1,6})\\s*(?:pesos|php)', text, re.I)
-    if range_match:
-        return f'{range_match.group(1)}-{range_match.group(2)}'
-    if re.search('(?:price|pesos|php|cost)', text, re.I):
-        range_match2 = re.search('(\\d{1,6})\\s+(?:to|and)\\s+(\\d{1,6})', text)
-        if range_match2:
-            return f'{range_match2.group(1)}-{range_match2.group(2)}'
+    """Detailed price-band extraction for the regex fallback. Covers every phrasing
+    the suite uses, with range patterns checked BEFORE single-bound ones so
+    'from N to M' / 'between N and M' resolve to a band, not a lone minimum.
+
+    Returns 'lo-hi' | 'lo-' | '-hi' | None (same shape the LLM parse emits)."""
+    # Bounded range: "between N and M", "from N to M", "N to/and/- M (pesos/php)".
+    m = re.search(r'(?:between|from|priced\s+from)\s+' + _RX_PRICE_NUM + r'\s*(?:to|and|-|–|until|up\s+to)\s*' + _RX_PRICE_NUM, text, re.I)
+    if not m:
+        m = re.search(_RX_PRICE_NUM + r'\s*(?:to|and|-|–)\s*' + _RX_PRICE_NUM + r'\s*(?:pesos|peso|php)', text, re.I)
+    if m:
+        lo, hi = _rx_price_int(m.group(1)), _rx_price_int(m.group(2))
+        return f'{lo}-{hi}' if lo != hi else f'{lo}-'
+    # Minimum only: "above/over/more than/greater than/at least/starting at/minimum of N".
+    m = re.search(r'(?:greater\s+than|more\s+than|over|above|at\s+least|starting\s+(?:at|from)|minimum\s+(?:of|spend\s+of)|no\s+less\s+than|cost[s]?\s+more\s+than|>=|>)\s*' + _RX_PRICE_NUM, text, re.I)
+    if m:
+        return f'{_rx_price_int(m.group(1))}-'
+    # Maximum only: "under/below/less than/at most/up to/no more than/cheaper than N".
+    m = re.search(r'(?:less\s+than|under|below|at\s+most|up\s+to|no\s+more\s+than|cheaper\s+than|maximum\s+(?:of)?|not\s+(?:more|over)\s+than|<=|<)\s*' + _RX_PRICE_NUM, text, re.I)
+    if m:
+        return f'-{_rx_price_int(m.group(1))}'
+    # Fallback: a bare "N to/and M" near any price word.
+    if re.search(r'price|pesos|peso|php|cost|budget', text, re.I):
+        m = re.search(r'(\d[\d,]*)\s+(?:to|and)\s+(\d[\d,]*)', text)
+        if m:
+            return f'{_rx_price_int(m.group(1))}-{_rx_price_int(m.group(2))}'
     return None
+
+def _extract_regex_constraints(text: str) -> dict:
+    """Best-effort structured attributes for the regex fallback, so a fallback spec
+    still carries a `constraints` map for the attribute-aware pick (the coverage
+    scorer matches constraint *values* against the product, so generic keys are
+    fine). Pulls colors, size labels, quoted literals, and number+unit tokens."""
+    cons: dict[str, str] = {}
+    tl = text.lower()
+    for w in re.findall(r'\b[a-z]+\b', tl):
+        if w in PARSE_HINT_COLOR_WORDS:
+            cons['color'] = w
+            break
+    sm = PARSE_HINT_SIZE_LABEL_RE.search(text)
+    if sm:
+        cons['size'] = sm.group(0).lower()
+    elif re.search(r'\b(large|medium|small)\b', tl):
+        cons['size'] = re.search(r'\b(large|medium|small)\b', tl).group(1)
+    quoted = re.findall(r"'([^']{2,40})'|\"([^\"]{2,40})\"", text)
+    for i, pair in enumerate(quoted[:3]):
+        val = (pair[0] or pair[1]).strip().lower()
+        if val:
+            cons[f'literal_{i}'] = val
+    um = re.search(r'\b(\d+(?:\.\d+)?)\s*(pcs|pieces|pack|set|ml|g|kg|mm|cm|gb|tb|mah|inch|inches|w|v)\b', tl)
+    if um:
+        cons['spec'] = f'{um.group(1)}{um.group(2)}'
+    return cons
 
 def _extract_service_flags(text_lower: str) -> str | None:
     svc_parts: list[str] = []
@@ -1927,7 +1979,7 @@ def _re_spec(text: str) -> dict:
     text_lower = text.lower()
     kw_tokens = _QueryTextAnalyzer.keyword_tokens(text)
     keywords = ' '.join(kw_tokens) or 'product'
-    return {'keywords': keywords, 'price_range': _extract_price_range(text), 'service': _extract_service_flags(text_lower)}
+    return {'keywords': keywords, 'price_range': _extract_price_range(text), 'service': _extract_service_flags(text_lower), 'constraints': _extract_regex_constraints(text)}
 
 def _regex_voucher_block(query: str) -> dict | None:
     """Parse the voucher rules straight from the query text.
