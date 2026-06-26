@@ -4853,14 +4853,6 @@ class JournalingProxyHttpClient:
     def get(self, path: str, params=None, **kw):
         return self.roundtrip('GET', path, params=params, **kw)
 
-class SameShopMultiSpecBundle(NamedTuple):
-    shop_id: str
-    product_ids: list[str]
-    think: str
-    leader_products: list[dict]
-    candidate_product_ids_by_spec: list[list[str]]
-    all_candidate_product_ids: list[str]
-
 class _DialoguePhaseTimer:
     __slots__ = ('label', '_t0', 'elapsed_ms', 'completed')
 
@@ -4990,25 +4982,6 @@ class _CandidatePoolMerger:
 
     def size(self) -> int:
         return len(self.pool)
-
-@dataclass
-class _VoucherMathSnapshot:
-    total: float = 0.0
-    discount: float = 0.0
-    total_after: float = 0.0
-    applied: bool = False
-    within_budget: bool = False
-
-    @classmethod
-    def evaluate(cls, prices: Sequence[float], voucher: dict) -> '_VoucherMathSnapshot':
-        raw = _AgentCore.compute_voucher_cart_math(list(prices), voucher)
-        return cls(total=float(raw.get('total', 0.0)), discount=float(raw.get('discount', 0.0)), total_after=float(raw.get('total_after', 0.0)), applied=bool(raw.get('applied', False)), within_budget=bool(raw.get('within_budget', False)))
-
-    def as_dict(self) -> dict[str, Any]:
-        return {'total': self.total, 'discount': self.discount, 'total_after': self.total_after, 'applied': self.applied, 'within_budget': self.within_budget}
-
-    def utilisation_against(self, budget: float) -> float:
-        return _AgentCore.voucher_utilisation_sort_key(self.total_after, budget)
 
 class _QueryHintExtractor:
     __slots__ = ('query', '_hints')
@@ -5350,54 +5323,6 @@ class _ListingProbeRunner:
         before = len(pool)
         _AgentCore.merge_find_product_hits_into_candidate_pool(self.response, pool, seen)
         return len(pool) - before
-
-class _DialogueNarrationFacade:
-
-    @staticmethod
-    def emit(ctx: 'DialogueRunContext', *, context: dict[str, Any], fallback: str, tool_results: list | None=None, force: bool=False) -> None:
-        rendered = _AgentCore.format_dialogue_step_reasoning_text(ctx.query, context, fallback=fallback, force=force)
-        _AgentCore.append_dialogue_step_with_tool_results(ctx, rendered, tool_results or [])
-
-    @staticmethod
-    def emit_terminal_failure(ctx: 'DialogueRunContext', *, fallback: str, context: dict[str, Any] | None=None) -> None:
-        ctx_payload = dict(context or {})
-        ctx_payload.setdefault('terminal_status', 'failure')
-        _AgentCore.finalize_dialogue_with_product_recommendation(ctx, [NO_MATCH_PRODUCT_ID_SENTINEL], 'failure', think=_AgentCore.format_dialogue_step_reasoning_text(ctx.query, ctx_payload, fallback=fallback, force=True))
-
-class _SpecOrderRoster:
-
-    @staticmethod
-    def rank_for(spec: dict[str, Any]) -> int:
-        return _AgentCore.spec_richness_rank_for_tiebreak(spec)
-
-    @staticmethod
-    def integer_for(spec: dict[str, Any]) -> int | None:
-        return _AgentCore.parse_product_order_rank_integer(spec.get('order'))
-
-    @staticmethod
-    def sorted_indices(specs: list[dict[str, Any]]) -> list[int]:
-        return sorted(range(len(specs)), key=lambda i: (_SpecOrderRoster.rank_for(specs[i]), i))
-
-class _ShoppingDialogueOrchestrator:
-    __slots__ = ('ctx',)
-
-    def __init__(self, ctx: 'DialogueRunContext' | None=None) -> None:
-        self.ctx = ctx if ctx is not None else DialogueRunContext()
-
-    def execute(self, problem_data: dict) -> list[dict]:
-        return _AgentCore.execute_shopping_dialogue_pipeline(self.ctx, problem_data)
-
-    def steps_so_far(self) -> list[dict]:
-        return list(self.ctx.steps)
-
-    def query_text(self) -> str:
-        return self.ctx.query
-
-    def metrics_snapshot(self) -> dict[str, Any]:
-        observer = getattr(self.ctx, 'metrics', None)
-        if isinstance(observer, _DialogueRunMetricsObserver):
-            return observer.as_payload()
-        return {'phase_count': 0, 'aggregate_ms': 0.0, 'phases': []}
 
 class _AgentCore:
 
