@@ -2963,17 +2963,29 @@ def _pipe_process_shop_query(ctx, params: dict) -> _ShopResult | None:
             ctx_found['constraint_checks'] = cc
         think_found = f'Case C ? no shop had all specs in the filtered pools, so `_anchor_strategy` ran (resolution_mode={resolution_mode}): ' + (f"partial-coverage fill: shop {case_c_ctx.get('winner_shop_id')} covered {n_specs - 1}/{n_specs} specs; missing spec filled by in-shop search." if resolution_mode == 4 else f'anchor v2: ranked top shops by LLM score, fetched 10 candidates per spec per shop, re-scored, then Case-B logic elected shop_id={winner_shop}.' if resolution_mode == 5 else f'anchor loop: picked anchor listing, fixed its shop, searched remaining specs within that shop.') + f' Final shop_id={winner_shop}; per-spec picks: {pick_lines}. All {len(resolved_pids)} product_ids come from that seller.'
         return _ShopResult(shop_id=winner_shop, product_ids=list(resolved_pids), think=think_found, leader_products=list(leaders_c), all_candidate_product_ids=all_cand_ids)
+    # Last resort: no single seller covers every spec. Rather than emit an
+    # all-sentinel cart (zero field-matching credit), return the best surviving
+    # candidate per spec - possibly cross-shop. Real product_ids earn partial
+    # rule-score credit on title/price/service/attrs; the shop-success bonus
+    # still needs one seller, which this won't satisfy. Position-safe distinct
+    # placeholders keep the scorer's per-spec alignment intact when a spec is
+    # empty (`_join_ids`/the validator both dedupe, so a shared sentinel would
+    # collapse and shift later real picks onto the wrong spec).
     is_shop_voucher = bool(params.get('is_shop_voucher', False))
-    if is_shop_voucher:
-        best_per_spec_pids: list[str] = []
-        for scored in spec_scored:
-            pid = str(scored[0][0].get('product_id', '')) if scored else ''
-            if pid:
-                best_per_spec_pids.append(pid)
-        if len(best_per_spec_pids) == n_specs:
-            fallback_think = f'Shop-voucher mode but anchor resolution failed: I still return the best surviving candidate per spec (first entry in each scored pool after threshold), which may come from different shops: product_ids={best_per_spec_pids}. This is a last-resort fallback ? it does not guarantee one seller for all items.'
-            return _ShopResult(shop_id='cross-shop-fallback', product_ids=list(best_per_spec_pids), think=fallback_think, leader_products=[], all_candidate_product_ids=all_cand_ids)
-    end_fail = f'Shop task failed: after retrieval, `_score_listings` filtering, Case C bidirectional/three-spec attempts, and `_anchor_strategy`, no seller covers every spec. No cross-shop fallback applies here (non?shop-voucher query). Final candidate ids by spec: {cand_ids_by_spec}; union={all_cand_ids}.'
+    best_per_spec_pids: list[str] = []
+    real_count = 0
+    for sidx, scored in enumerate(spec_scored):
+        pid = str(scored[0][0].get('product_id', '')) if scored else ''
+        if pid:
+            best_per_spec_pids.append(pid)
+            real_count += 1
+        else:
+            best_per_spec_pids.append(f'{SENTINEL_PID}_{sidx}')
+    if real_count:
+        mode = 'Shop-voucher' if is_shop_voucher else 'Shop'
+        fallback_think = f'{mode} anchor resolution found no single seller covering every spec, so I return the best surviving candidate per spec (first entry in each scored pool after threshold; a placeholder where a spec had no survivor). These may come from different shops: product_ids={best_per_spec_pids}. Last-resort fallback ? it does not guarantee one seller for all items.'
+        return _ShopResult(shop_id='cross-shop-fallback', product_ids=list(best_per_spec_pids), think=fallback_think, leader_products=[], all_candidate_product_ids=all_cand_ids)
+    end_fail = f'Shop task failed: after retrieval, `_score_listings` filtering, Case C bidirectional/three-spec attempts, and `_anchor_strategy`, no seller covers every spec, and no spec had any surviving candidate. Final candidate ids by spec: {cand_ids_by_spec}; union={all_cand_ids}.'
     _pipe_finalize(ctx, [SENTINEL_PID], 'failure', think=end_fail)
     return None
 
@@ -2992,13 +3004,19 @@ def _pipe_run_shop_voucher(ctx, params: dict) -> None:
         _pipe_run_voucher(ctx, params)
         return
     voucher = _norm_voucher(params.get('voucher'))
-    allowed_total = _voucher_ceiling(voucher)
-    if not allowed_total or allowed_total <= 0:
-        _pipe_finalize(ctx, [SENTINEL_PID], 'failure', think='Could not calculate allowed total from voucher parameters.')
-        return
+    ceiling = _voucher_ceiling(voucher)
+    have_budget = bool(ceiling and ceiling > 0)
+    allowed_total = float(ceiling) if have_budget else 0.0
     threshold = float(voucher.get('threshold', 0) or 0.0)
     result = _pipe_process_shop_query(ctx, params)
     if not result:
+        return
+    if not have_budget:
+        # Voucher math unavailable: recommend the best same-shop cart on relevance
+        # alone. The scorer recomputes the budget from prices anyway, so real
+        # product_ids earn field-matching credit where a sentinel earns zero.
+        soft = f'Voucher math could not be computed from the parsed parameters, so I recommend the best same-shop cart on relevance alone: product_ids={result.product_ids} (shop_id={result.shop_id}).'
+        _pipe_finalize(ctx, result.product_ids, 'failure', think=soft)
         return
     leaders = result.leader_products
     cart_total = sum((float(x.get('price', 0) or 0.0) for x in leaders))
@@ -3118,19 +3136,18 @@ def _pipe_run_voucher(ctx, params: dict) -> None:
         _pipe_finalize(ctx, [SENTINEL_PID], 'failure', think='No product specs found in voucher query.')
         return
     voucher = _norm_voucher(params.get('voucher'))
-    allowed_total = _voucher_ceiling(voucher)
-    if not allowed_total or allowed_total <= 0:
-        _pipe_finalize(ctx, [SENTINEL_PID], 'failure', think='Could not calculate allowed total from voucher parameters.')
-        return
-    allowed_total = float(allowed_total)
+    ceiling = _voucher_ceiling(voucher)
+    have_budget = bool(ceiling and ceiling > 0)
+    allowed_total = float(ceiling) if have_budget else 0.0
     threshold = float(voucher.get('threshold', 0) or 0.0)
+    at_disp = f'{allowed_total:.2f}' if have_budget else 'unavailable (voucher math could not be computed from the parsed parameters)'
     plan = (f'Voucher plan ({n_specs} spec(s), relevance-first). The voucher math only sets a '
-            f'pre-discount cart ceiling allowed_total={allowed_total:.2f} (from budget={voucher.get("budget")}, '
+            f'pre-discount cart ceiling allowed_total={at_disp} (from budget={voucher.get("budget")}, '
             f'threshold={threshold:.2f}, discount), and the correct products already fit under it. '
             f'So I pick the best-matching product per spec on relevance alone: search each spec on its '
             f'own keywords (pages 1-2, no budget band), rank with `_score_listings`, and elect the winner '
-            f'with `_elect_best`. Only if the assembled cart exceeds allowed_total do I swap a pick for a '
-            f'cheaper alternative that still clears the relevance floor ({VOUCHER_SCORE_FLOOR}).')
+            f'with `_elect_best`. Only if the assembled cart exceeds a known allowed_total do I swap a pick '
+            f'for a cheaper alternative that still clears the relevance floor ({VOUCHER_SCORE_FLOOR}).')
     pools: list[dict | None] = []
     picks: list[dict | None] = []
     all_calls: list = []
@@ -3146,38 +3163,58 @@ def _pipe_run_voucher(ctx, params: dict) -> None:
         picks.append(best)
     _pipe_append_step(ctx, plan, all_calls)
     empty_specs = [i for i, p in enumerate(pools) if p is None]
-    if empty_specs:
-        _pipe_finalize(ctx, [SENTINEL_PID], 'failure', think=f'No listings found for spec(s) {empty_specs} after relevance search (pages 1-2, with and without the stated price band). Cannot assemble a voucher cart.')
+    resolved_specs = [i for i, p in enumerate(picks) if p is not None]
+    if not resolved_specs:
+        # Genuinely nothing to recommend - a sentinel is the only honest output.
+        _pipe_finalize(ctx, [SENTINEL_PID], 'failure', think=f'No listings found for any of the {n_specs} spec(s) after relevance search (pages 1-2, with and without the stated price band). Cannot assemble a voucher cart.')
         return
 
-    def _cart_total(items: list[dict]) -> float:
-        return sum((float(x.get('price', 0) or 0.0) for x in items))
+    def _cart_total(items: list) -> float:
+        return sum((float(x.get('price', 0) or 0.0) for x in items if x is not None))
     initial_total = _cart_total(picks)
     cart_total = initial_total
     swaps = 0
-    for _ in range(BUDGET_SWAP_LIMIT):
-        if cart_total <= allowed_total + 1e-06:
-            break
-        swap = _swap_cheaper(products, pools, picks, VOUCHER_SCORE_FLOOR, MIN_SWAP_DELTA)
-        if swap is None:
-            break
-        sidx, new_p, new_s = swap
-        new_p = dict(new_p)
-        new_p['_llm_relevance_score'] = float(new_s)
-        cart_total += float(new_p.get('price', 0) or 0.0) - float(picks[sidx].get('price', 0) or 0.0)
-        picks[sidx] = new_p
-        swaps += 1
-    pools_for_weigh = [[row for row, _ in (pools[i].get('scored') or [])] for i in range(n_specs)]
+    # Budget-driven swap-down only runs when the voucher math gave a real ceiling.
+    # Without one we still recommend the relevance picks: their product_ids earn
+    # partial field-matching credit, whereas a sentinel earns zero.
+    if have_budget and not empty_specs:
+        for _ in range(BUDGET_SWAP_LIMIT):
+            if cart_total <= allowed_total + 1e-06:
+                break
+            swap = _swap_cheaper(products, pools, picks, VOUCHER_SCORE_FLOOR, MIN_SWAP_DELTA)
+            if swap is None:
+                break
+            sidx, new_p, new_s = swap
+            new_p = dict(new_p)
+            new_p['_llm_relevance_score'] = float(new_s)
+            cart_total += float(new_p.get('price', 0) or 0.0) - float(picks[sidx].get('price', 0) or 0.0)
+            picks[sidx] = new_p
+            swaps += 1
+    pools_for_weigh = [[row for row, _ in (pools[i].get('scored') or [])] if pools[i] else [] for i in range(n_specs)]
     _pipe_weigh_multi(ctx, list(picks), pools_for_weigh, products)
-    ordered_pids = [str(p.get('product_id', '')) for p in picks]
-    within = bool(threshold <= cart_total <= allowed_total + 1e-06)
+    # Positional product_ids: the real pick where a spec resolved, a distinct
+    # sentinel placeholder for an empty spec so the scorer's positional
+    # spec<->product alignment is preserved (resolved specs still score; only the
+    # empty one is 0). Distinct `0_i` placeholders avoid the dedupe collapse that
+    # a shared sentinel would cause when >1 spec is empty.
+    ordered_pids = [str(picks[i].get('product_id', '')) if picks[i] is not None else f'{SENTINEL_PID}_{i}' for i in range(n_specs)]
+    all_resolved = not empty_specs
+    within = bool(have_budget and threshold <= cart_total <= allowed_total + 1e-06)
+    status = 'success' if all_resolved else 'failure'
     repaired = f', repaired to {cart_total:.2f} via {swaps} cheaper-swap(s)' if swaps else ''
-    fit_note = 'Cart fits the voucher window.' if within else 'Cart sits outside the ideal window, but these are the best-matching products, so I recommend them.'
+    if empty_specs:
+        fit_note = f'No listing surfaced for spec(s) {empty_specs}; I keep a placeholder there and recommend the best-matching real products for the rest.'
+    elif not have_budget:
+        fit_note = 'Voucher math was unavailable, so I recommend the best-matching products on relevance alone.'
+    elif within:
+        fit_note = 'Cart fits the voucher window.'
+    else:
+        fit_note = 'Cart sits outside the ideal window, but these are the best-matching products, so I recommend them.'
     done = (f'Voucher cart assembled ({n_specs} spec(s)). Relevance-first picks gave a pre-discount total '
-            f'of {initial_total:.2f}{repaired} against allowed_total={allowed_total:.2f} '
+            f'of {initial_total:.2f}{repaired} against allowed_total={at_disp} '
             f'(threshold={threshold:.2f}, budget={voucher.get("budget")}). Final product_ids={ordered_pids}. {fit_note}')
     _pipe_append_step(ctx, done, [])
-    _pipe_finalize(ctx, ordered_pids, 'success')
+    _pipe_finalize(ctx, ordered_pids, status)
 
 import json
 import re
