@@ -13,6 +13,68 @@ from typing import NamedTuple as _NamedTuple
 from urllib.parse import quote_plus
 from src.agent.proxy_client import ProxyClient
 from src.agent.agent_interface import Tool, create_dialogue_step, execute_tool_call
+import logging as _logging
+import urllib.request as _urlrequest
+
+# Slack webhook for important (WARNING+) agent logs. Override / disable via the
+# AGENT_SLACK_WEBHOOK env var (set it empty to turn Slack forwarding off).
+# NOTE: this is a secret; prefer setting it via env in deployment rather than
+# relying on this in-source default.
+_SLACK_WEBHOOK_URL = getenv('AGENT_SLACK_WEBHOOK', '')
+
+class _SlackLogHandler(_logging.Handler):
+    """Forward WARNING+ agent logs to Slack. Fire-and-forget (posts on a daemon
+    thread) and never raises, so logging can't slow down or crash the agent."""
+
+    def __init__(self, webhook: str, level: int = _logging.WARNING) -> None:
+        super().__init__(level)
+        self._webhook = webhook or ''
+
+    def emit(self, record: '_logging.LogRecord') -> None:
+        if not self._webhook:
+            return
+        try:
+            text = self.format(record)
+        except Exception:
+            return
+        threading.Thread(target=self._post, args=(text,), daemon=True).start()
+
+    def _post(self, text: str) -> None:
+        try:
+            body = json.dumps({'text': f':rotating_light: {text[:3500]}'}).encode('utf-8')
+            req = _urlrequest.Request(self._webhook, data=body, headers={'Content-Type': 'application/json'})
+            _urlrequest.urlopen(req, timeout=5).read()
+        except Exception:
+            pass  # network/Slack failure must never affect the agent
+
+def _setup_agent_logger() -> '_logging.Logger':
+    """Agent logger. Writes WARN/ERROR (and INFO) to stderr (captured by the
+    sandbox output bundle) and, when writable, to AGENT_LOG_FILE (default
+    /app/logs/agent.log — the only writable mount in the hardened sandbox).
+    Level via AGENT_LOG_LEVEL (default INFO)."""
+    logger = _logging.getLogger('oro.agent')
+    if logger.handlers:
+        return logger
+    level = getattr(_logging, getenv('AGENT_LOG_LEVEL', 'INFO').upper(), _logging.INFO)
+    logger.setLevel(level)
+    logger.propagate = False
+    fmt = _logging.Formatter('%(asctime)s %(levelname)s [agent] %(message)s')
+    stream = _logging.StreamHandler()
+    stream.setFormatter(fmt)
+    logger.addHandler(stream)
+    try:
+        fh = _logging.FileHandler(getenv('AGENT_LOG_FILE', '/app/logs/agent.log'), mode='a', encoding='utf-8')
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    except OSError:
+        pass  # read-only / unavailable path: stderr handler still active
+    if _SLACK_WEBHOOK_URL:
+        slack = _SlackLogHandler(_SLACK_WEBHOOK_URL, level=_logging.WARNING)
+        slack.setFormatter(fmt)
+        logger.addHandler(slack)
+    return logger
+
+LOGGER = _setup_agent_logger()
 ListingRow = dict[str, Any]
 SpecEntry = dict[str, Any]
 _CHUTES_MODELS: dict[str, Any] = {'PRODUCT_PARSE_': 'deepseek-ai/DeepSeek-V3.1-TEE', 'VOUCHER_PARSE_': 'deepseek-ai/DeepSeek-V3.1-TEE', 'PRODUCT_RANK_': 'deepseek-ai/DeepSeek-V3-0324-TEE', 'FINAL_FALLBAC_': 'google/gemma-4-31B-turbo-TEE', 'BACKUP_LLM_': 'deepseek-ai/DeepSeek-V3.1-TEE', 'SHOP_PARSE_': 'deepseek-ai/DeepSeek-V3.1-TEE', 'PICK_CHAIN': ['google/gemma-4-31B-turbo-TEE', 'deepseek-ai/DeepSeek-V3.1-TEE', 'deepseek-ai/DeepSeek-V3-0324-TEE'], 'SCORE_CHAIN': ['deepseek-ai/DeepSeek-V3.1-TEE', 'deepseek-ai/DeepSeek-V3-0324-TEE', 'google/gemma-4-31B-turbo-TEE']}
@@ -1911,7 +1973,8 @@ def _llm_param_snapshot(query: str, task_type: str) -> dict:
         parsed = _parse_llm_params_response(result, task_type)
         if parsed is not None:
             return parsed
-        msg = 'returned unparseable response' if result and result.get('choices') else 'returned no response'
+        LOGGER.debug('parse model %s: %s', model, 'unparseable response' if result and result.get('choices') else 'no response')
+    LOGGER.warning('LLM param parse failed (task=%s); using regex fallback for query=%r', task_type, str(query)[:160])
     return _regex_param_snapshot(query)
 
 class _ShopResult(_NamedTuple):
@@ -2143,9 +2206,11 @@ def run(ctx: '_PipeCtx', problem_data: dict) -> list[dict]:
     try:
         _execute_session_core(ctx)
     except Exception:
+        LOGGER.exception('run() pipeline crashed for query=%r', str(getattr(ctx, 'query', ''))[:200])
         try:
             _pipe_finalize(ctx, [SENTINEL_PID], 'failure')
         except Exception:
+            LOGGER.exception('run() failure-finalize also crashed')
             ctx.steps.append(create_dialogue_step('Done.', [], 'Done.', ctx.query, len(ctx.steps) + 1))
     return _pipeline_session_finish(ctx)
 
@@ -2179,6 +2244,8 @@ def _pipe_append_step(ctx, think: str, tool_results: list, response: str='') -> 
 def _pipe_finalize(ctx, product_ids: list, status: str, think: str='', llm_reason: str='') -> None:
     fmt_ids = _join_ids(product_ids)
     qprev = str(getattr(ctx, 'query', '') or '')[:240]
+    if status != 'success':
+        LOGGER.warning('shop/voucher finalize status=%s ids=%s query=%r', status, fmt_ids, qprev[:160])
     rec = _call_api('recommend_product', {'product_ids': fmt_ids})
     term = _call_api('terminate', {'status': status})
     if not think:
@@ -4023,7 +4090,8 @@ def P50_llm_parse_full_shopping_parameters(query: str, task_type: str) -> dict:
         parsed = P50_parse_llm_parameter_json_or_none(result, task_type)
         if parsed is not None:
             return parsed
-        msg = 'returned unparseable response' if result and result.get('choices') else 'returned no response'
+        LOGGER.debug('P50 parse model %s: %s', model, 'unparseable response' if result and result.get('choices') else 'no response')
+    LOGGER.warning('P50 LLM param parse failed (task=%s); using regex fallback for query=%r', task_type, str(query)[:160])
     return P50_build_regex_fallback_parameter_snapshot(query)
 
 def P50_parse_llm_parameter_json_or_none(result: dict, task_type: str) -> dict | None:
@@ -4362,10 +4430,11 @@ def P50_dispatch_task_to_branch_handler(ctx: 'DialogueRunContext', task_type: st
     try:
         P50_run_single_product_task_branch(ctx, params)
     except Exception:
+        LOGGER.exception('P50 product branch crashed for query=%r', str(getattr(ctx, 'query', ''))[:200])
         try:
             P50_finalize_dialogue_product_recommendation(ctx, [P50_NO_MATCH_PRODUCT_ID_SENTINEL], 'failure')
         except Exception:
-            pass
+            LOGGER.exception('P50 dispatch failure-finalize crashed')
 
 def P50_execute_dialogue_from_parsed_parameters(ctx: 'DialogueRunContext') -> None:
     try:
@@ -4386,10 +4455,11 @@ def P50_execute_dialogue_from_parsed_parameters(ctx: 'DialogueRunContext') -> No
         P50_append_dialogue_step_tool_results(ctx, init_fallback, [])
         P50_dispatch_task_to_branch_handler(ctx, task_type, params)
     except Exception:
+        LOGGER.exception('P50 dialogue parse/dispatch crashed for query=%r', str(getattr(ctx, 'query', ''))[:200])
         try:
             P50_finalize_dialogue_product_recommendation(ctx, [P50_NO_MATCH_PRODUCT_ID_SENTINEL], 'failure')
         except Exception:
-            pass
+            LOGGER.exception('P50 execute failure-finalize crashed')
 
 def P50_append_dialogue_step_tool_results(ctx, think: str, tool_results: list, response: str='') -> None:
     compact = [P50_compact_find_product_tool_result_for_trace(tc) for tc in tool_results or []]
@@ -4398,6 +4468,8 @@ def P50_append_dialogue_step_tool_results(ctx, think: str, tool_results: list, r
 def P50_finalize_dialogue_product_recommendation(ctx, product_ids: list, status: str, think: str='', llm_reason: str='') -> None:
     fmt_ids = P50_join_product_ids_as_csv_ordered(product_ids)
     qprev = str(getattr(ctx, 'query', '') or '')[:240]
+    if status != 'success':
+        LOGGER.warning('product finalize status=%s ids=%s query=%r', status, fmt_ids, qprev[:160])
     rec = P50_invoke_sandbox_tool_with_gap_and_retry('recommend_product', {'product_ids': fmt_ids})
     term = P50_invoke_sandbox_tool_with_gap_and_retry('terminate', {'status': status})
     if not think:
@@ -4493,9 +4565,11 @@ def P50_agent_main(problem_data: dict) -> list[dict]:
         try:
             P50_execute_dialogue_from_parsed_parameters(ctx)
         except Exception:
+            LOGGER.exception('P50_agent_main pipeline crashed for query=%r', str(getattr(ctx, 'query', ''))[:200])
             try:
                 P50_finalize_dialogue_product_recommendation(ctx, [P50_NO_MATCH_PRODUCT_ID_SENTINEL], 'failure')
             except Exception:
+                LOGGER.exception('P50_agent_main failure-finalize crashed')
                 ctx.steps.append(create_dialogue_step('Done.', [], 'Done.', ctx.query, len(ctx.steps) + 1))
         if not ctx.steps:
             ctx.steps.append(create_dialogue_step('Done.', [], 'Done.', ctx.query, 1))
@@ -4507,7 +4581,2428 @@ def agent_main(problem_data: dict) -> list[dict]:
     problem_data = _EmptyProblemDataProcessor.ensure(problem_data)
     _oro_reset_problem()
     query = problem_data.get('query', '') if isinstance(problem_data, dict) else ''
-    if _route_task_kind(query) == 'product':
-        return P50_agent_main(problem_data)
-    ctx = _PipeCtx()
-    return run(ctx, problem_data)
+    task = _route_task_kind(query)
+    pid = (problem_data.get('problem_id') or problem_data.get('id')) if isinstance(problem_data, dict) else None
+    LOGGER.info('agent_main start problem_id=%s task=%s query=%r', pid, task, str(query)[:160])
+    try:
+        if task == 'product':
+            try:
+                steps = product_agent_main(problem_data)
+            except Exception:
+                LOGGER.exception('topcode product flow crashed; falling back to P50 for problem_id=%s', pid)
+                steps = P50_agent_main(problem_data)
+        else:
+            steps = run(_PipeCtx(), problem_data)
+        LOGGER.info('agent_main done problem_id=%s task=%s steps=%d', pid, task, len(steps))
+        return steps
+    except Exception:
+        LOGGER.exception('agent_main crashed problem_id=%s task=%s', pid, task)
+        raise
+
+
+# ============================================================================
+# Inlined top-code product namespace (formerly src/agent/agent_topcode.py).
+# Self-contained _AgentCore single-product flow. Its catalogue tools are NOT
+# re-registered (@Tool removed); it reuses the tools registered above via
+# execute_tool_call. Entry point: product_agent_main (routed from agent_main).
+# ============================================================================
+import json
+import logging
+import random
+import re
+import time
+import threading
+from dataclasses import dataclass, field
+from collections import defaultdict
+from collections.abc import Sequence
+from itertools import product as cartesian_product
+from os import getenv
+from typing import Any, NamedTuple
+from urllib.parse import quote_plus
+from src.agent.proxy_client import ProxyClient
+from src.agent.agent_interface import Tool, create_dialogue_step, execute_tool_call
+logger = logging.getLogger(__name__)
+CatalogListingDict = dict[str, Any]
+ParsedProductSpecDict = dict[str, Any]
+INFERENCE_MODEL_REGISTRY: dict[str, Any] = {'PRODUCT_PARSE_MODEL': 'deepseek/deepseek-v3.2', 'VOUCHER_PARSE_MODEL': 'deepseek/deepseek-v3.2', 'SHOP_PARSE_MODEL': 'deepseek/deepseek-v3.2', 'FINAL_FALLBACK_MODEL': 'google/gemma-4-31b-it', 'PRODUCT_RANK_MODEL': 'z-ai/glm-5.1', 'BACKUP_LLM_MODEL': 'deepseek/deepseek-v3.2', 'PICK_CHAIN': ['google/gemma-4-31b-it', 'deepseek/deepseek-v3.2', 'z-ai/glm-5.1'], 'SCORE_CHAIN': ['google/gemma-4-31b-it', 'deepseek/deepseek-v3.2', 'z-ai/glm-5.1']}
+MULTI_PRODUCT_CLAUSE_SPLIT_PATTERN = re.compile('(?:,?\\s*and\\s+also\\s+|,?\\s*also,?\\s*|Second(?:ly)?,\\s*|Third(?:ly)?,\\s*|First,\\s*|\\(\\d+\\)\\s*|\\d+\\.\\s*|Additionally,\\s*|Furthermore,\\s*|Moreover,\\s*|In\\s+addition,?\\s*|Plus,\\s*|On\\s+top\\s+of\\s+that,?\\s*|[.]\\s*Next,\\s*|[.]\\s*Lastly,\\s*|[.]\\s*Finally,\\s*|[.]\\s*Last,\\s*|\\bThen\\s*,?\\s*I\\s+(?:need|want|also)\\b|\\bI\\s+also\\s+(?:want|need)\\b)', re.IGNORECASE)
+BUDGET_OR_VOUCHER_MENTION_PATTERN = re.compile('(?:My budget|budget is|I have a voucher)', re.IGNORECASE)
+RELEVANCE_SCORING_STOPWORDS: frozenset[str] = frozenset({'the', 'a', 'an', 'for', 'with', 'from', 'that', 'this', 'i', 'me', 'my', 'looking', 'show', 'find', 'want', 'need', 'get', 'finish', 'buy', 'also', 'and', 'in', 'is', 'it', 'am', 'im', 'priced', 'pesos', 'php', 'price', 'between', 'than', 'above', 'below', 'more', 'less', 'over', 'under', 'of', 'to', 'or', 'on', 'at', 'by', 'its', 'be', 'can', 'has', 'have', 'will', 'would', 'should', 'item', 'items', 'both', 'these', 'offering', 'sells', 'shop', 'budget', 'voucher', 'discount', 'first', 'second', 'third', 'brand', 'made', 'using', 'available', 'support', 'supports', 'compatible', 'please', 'age', 'use', 'replacement'})
+SEARCH_KEYWORD_SYNONYM_MAP = {'ballpoint': 'ball'}
+QUERY_TOKENIZATION_STOPWORDS = {'the', 'and', 'for', 'with', 'from', 'that', 'this', 'are', 'was', 'can', 'has', 'have', 'been', 'will', 'find', 'finish', 'looking', 'show', 'want', 'need', 'get', 'buy', 'product', 'products', 'search', 'same', 'shop', 'within', 'budget', 'voucher', 'discount', 'price', 'priced', 'pesos', 'php', 'between', 'than', 'greater', 'less', 'more', 'under', 'over', 'about', 'also', 'both', 'these', 'them', 'each', 'all', 'one', 'two', 'three', 'four', 'use', 'five', 'offering', 'sells', 'using', 'in', 'is', 'it', 'its', 'or', 'at', 'on', 'by', 'be', 'do', 'an', 'my', 'me', 'im', 'items', 'item', 'just', 'first', 'second', 'supports', 'replacement', 'support', 'compatible', 'available', 'made', 'please', 'like', 'of', 'above', 'deals', 'options', 'option', 'delivery', 'shipping', 'offers', 'lazmall', 'lazflash', 'official', 'cash', 'payment', 'pay', 'cost', 'costs', 'via', 'themed', 'such', 'those', 'store', 'stores', 'focus', 'category', 'specifically', 'guaranteed', 'authenticity', 'returns', 'quick', 'perks', 'should', 'help', 'purchase', 'type', 'to', 'named', 'called', 'family', 'belongs', 'comes', 'another', 'lastly', 'benefits', 'you', 'weighing', 'capacity', 'size', 'sized', 'eu', 'fits'}
+DIALOGUE_SESSION_TIMEOUT_SECONDS = 250.0
+NO_MATCH_PRODUCT_ID_SENTINEL = '0'
+FALLBACK_CATALOG_SEARCH_QUERY = 'product'
+CATALOG_FIND_PRODUCT_API_PATH = '/search/find_product'
+CATALOG_HTTP_MAX_REQUESTS_PER_MINUTE = 90
+RATE_LIMIT_WINDOW_SECONDS = 60.0
+MIN_SECONDS_BETWEEN_CATALOG_CALLS = 0.7
+MIN_SECONDS_BETWEEN_SANDBOX_TOOL_CALLS = 0.5
+SANDBOX_TOOL_MAX_RETRY_ATTEMPTS = 3
+SANDBOX_TOOL_RETRY_BACKOFF_BASE_SECONDS = 1.0
+LLM_COMPLETION_MAX_ATTEMPTS_PER_MODEL = 1
+DIALOGUE_TOOL_RESULT_LISTING_CAP = 10
+LLM_JUDGE_FAST_ACCEPT_SCORE_THRESHOLD = 8.0
+LLM_JUDGE_LOW_CONFIDENCE_SCORE_THRESHOLD = 6.0
+SINGLE_PRODUCT_PROBE_MAX_ELAPSED_SECONDS = 220.0
+SINGLE_PRODUCT_FINALIZE_MAX_ELAPSED_SECONDS = 250.0
+CANDIDATE_POOL_DEFAULT_LIMIT = 10
+INTERNAL_PRICE_SCALE_DIVISOR = 100000
+SAME_SHOP_LISTING_MIN_LLM_SCORE = 6.0
+SAME_SHOP_TOP_SHOP_COUNT = 7
+ANCHOR_STRATEGY_MAX_SHOPS_TO_TRY = 12
+ANCHOR_STRATEGY_PER_SHOP_TIMEOUT_SECONDS = 10.0
+TWO_SPEC_VOUCHER_TOP_SHOP_COUNT = 6
+TWO_SPEC_BIDIRECTIONAL_POOL_CAP = 60
+TWO_SPEC_COLLECT_PER_SPEC_CAP = 20
+TWO_SPEC_MIN_ACCEPTABLE_LLM_SCORE = 5.0
+THREE_SPEC_TOP_SHOP_COUNT = 3
+THREE_SPEC_CANDIDATE_POOL_CAP = 60
+THREE_SPEC_PER_SHOP_LISTING_LIMIT = 10
+THREE_SPEC_COLLECT_CAP = 20
+SKIP_FULL_COVERAGE_FOR_SPEC_COUNTS: frozenset[int] = frozenset()
+SHOP_RANK_SKIP_REASON_SHOP_ID = 1
+SHOP_RANK_SKIP_REASON_NO_CROSS_SPEC_HIT = 2
+SHOP_RANK_SKIP_REASON_ANCHOR_PRICE = 3
+SHOP_RANK_SKIP_REASON_VOUCHER_BAND = 4
+SHOP_RANK_SKIP_REASON_VOUCHER_PRICE = 5
+VOUCHER_LISTING_MIN_LLM_SCORE = 5.0
+VOUCHER_SWAP_MIN_PRICE_IMPROVEMENT = 1.0
+VOUCHER_BUDGET_SWAP_MAX_ITERATIONS = 64
+SINGLE_PRODUCT_SHORTLIST_SIZE = 10
+SINGLE_PRODUCT_BATCH_LLM_SCORE_CAP = 15
+SINGLE_PRODUCT_ENABLE_DUAL_JUDGE_CONSISTENCY = True
+SINGLE_PRODUCT_DUAL_JUDGE_SCORE_GAP = 1.5
+SINGLE_PRODUCT_ENABLE_THIRD_PAGE = True
+SINGLE_PRODUCT_ENABLE_ALT_QUERY_PROBE = True
+VOUCHER_COMBO_K_PER_SPEC = 16
+VOUCHER_COMBO_MAX_COMBOS = 9000
+VOUCHER_COMBO_SCORE_THRESHOLD = 5.0
+VOUCHER_UTILISATION_TARGET = 0.88
+PARSE_HINT_COLOR_WORDS = frozenset({'red', 'blue', 'green', 'yellow', 'black', 'white', 'pink', 'purple', 'violet', 'orange', 'brown', 'gray', 'grey', 'beige', 'navy', 'gold', 'silver', 'bronze', 'copper', 'ivory', 'cream', 'khaki', 'maroon', 'burgundy', 'teal', 'turquoise', 'olive', 'tan', 'rose', 'magenta', 'cyan', 'indigo'})
+PARSE_HINT_SIZE_LABEL_RE = re.compile('\\b(?:xxs|xs|s|m|l|xl|xxl|xxxl|2xl|3xl|4xl|5xl|\\d+xl)\\b', re.IGNORECASE)
+NUM_UNIT_TOKEN_RE = re.compile('\\b\\d+(?:\\.\\d+)?(?:g|kg|ml|l|cm|mm|m|inch|in|gb|tb|mb|k|oz|lb|pcs|pc|pk|pack)\\b', re.IGNORECASE)
+ONLY_PRODUCT_TYPE_SEARCH_NOTE: str = "The query refers to the product type alone with no additional qualifiers (no brand, color, material, or numeric spec). Appending 'only' to the search query narrows results to this exact product type and avoids unrelated products that merely contain this term."
+LLM_JSON_INPUT_PREAMBLE = 'Input format: a JSON object with:\n  * "query" — the raw user request (always present).\n  * "regex_hints" (optional) — deterministic pre-analysis of the query:\n      - quoted_literals: strings in quotes (almost always attribute values).\n      - number_unit_tokens: normalised num+unit pairs like "10pcs", "20ml", "1.5k".\n      - size_labels: detected size tokens like "l", "5xl".\n      - color_words: universal color vocabulary present in the query.\n      - service_tags: already-mapped service enum values (official/freeShipping/COD/flashsale).\n  * "catalog_attribute_keys_seen" (optional) — catalog attribute keys observed\n      from product details this session; prefer these key names over generic ones.\n\nUse "regex_hints" as confirmed signals — your extraction should include them\nunless the query clearly contradicts. Use "catalog_attribute_keys_seen" as a\nvocabulary pool when choosing constraint key names.\n\n'
+LLM_PARSE_RULES_COMMON = 'Rules for keywords:\n  * Concatenate in the same left-to-right order as the raw query.\n  * Include: product type, brand, material, color (with modifiers), quantity + unit, volume/weight, dimensions, capacity, fit, style, length, use-case, packaging hints.\n  * **Use-case / audience / setting (required):** When the query states who or what a product is for—e.g. "for students", "office use", "suitable for", "ideal for kids", "school", "travel", "outdoor"—you **must** put every distinct use-case noun or setting token into `keywords` in left-to-right order. Strip only glue words (`suitable`, `ideal`, `perfect`, `for`, `use`); **never** omit the audience/setting words (`students`, `office`, `kids`, `hiking`, etc.). Example: `suitable for students and office use` → keywords must include `students` and `office`. Do not drop stated use-case tokens to save words; if near the 8-word cap, drop generic filler before dropping any use-case token.\n  * Exclude any service/shipping wording.\n  * Whenever the user gives a number with a physical or commerce unit(e.g. measured quantities and units), **extract it into `keyword`** and normalize to **digits first, unit letters immediately after with no space** (ASCII digits + Latin unit suffix in one token). Cover length, width, height, depth, diameter, screen/TV diagonal, area/volume, weight, capacity, electrical draw (W, V, A, mAh), data size (`128GB`), thread/pitch where numeric, **pack or piece counts** (`6pcs`, `12pk`, `3pack`), multi-axis sizes on one shared unit when natural (`200x300mm`, `10x20cm`). Examples: `2m`, `1.5cm`, `55inch`, `500ml`, `65W`, `19V`, `6pcs`. Never split into a number token plus a spelled-out unit word (`5 meter` → `5m`; `3 pieces` → `3pcs`). Ranges: prefer one compact token when one unit applies (`10-20cm`). Preserve meaningful token order for the rest of the line.\n  * When "any" precedes a descriptor (e.g. "any flavor"), retain the pair verbatim.\n  * When the user quotes a word or phrase (single-quoted or double-quoted), keep that quoted combination verbatim in keywords—including the quote marks and every word inside—in the same left-to-right position as the raw query. Do not strip quotes, split the phrase, or drop inner words. Example: `shoes \'as show\' nike` -> `shoes \'as show\' nike`.\n\nRules for price_range (digit side of the hyphen is mandatory — never invert):\n  * Bounded ("from 1889 to 3315 PHP", "between 500 and 1200"): "lo-hi" e.g. "1889-3315".\n  * Minimum only ("above 1513", "over 1383", "greater than 500", "at least 500"): "lo-" with the number BEFORE the hyphen e.g. "1513-" — NEVER "-1513".\n  * Maximum only ("below 1200", "under 500", "at most 800"): "-hi" with the number AFTER the hyphen e.g. "-1200" — NEVER "1200-".\n  * null when no numeric price bound appears in that product\'s slice.\n\nRules for only_product_type:\n  * true when keywords name a product type alone (including multi-word compound nouns). Append `only` to the keyword if it is true (e.g. `yoga mat` -> `yoga mat only`, `USB hub` -> `USB hub only`).\n  * false when any attribute (brand, color, material, numeric spec, adjective) is present beyond the bare noun.\n\nRules for service (map user wording -> enum):\n  * official store / guaranteed authenticity / quick returns -> "official"\n  * free shipping / free delivery                            -> "freeShipping"\n  * COD / cash on delivery / payment on delivery             -> "COD"\n  * flash deal / limited-time deal / flash sale              -> "flashsale"\n  * Combine multiple with commas; null when none apply.\n\n'
+LLM_PARSE_RULES_PRODUCT_ORDER = 'Rules for order:\n  * List products[] in the same left-to-right order as each distinct product intent appears in the raw query. Do not sort or reorder the array by richness or by order.\n  * Single-product requests: use "order": "1st" only.\n  * Multiple products: assign "1st", "2nd", … by decreasing information richness (most specific / constrained = "1st"). Use this only as a richness rank for tie-breaking ? do not move array entries to match it.\n  * Values must be a permutation covering every product exactly once (each rank used once).\n\n'
+LLM_PROMPT_PARSE_SINGLE_PRODUCT = LLM_JSON_INPUT_PREAMBLE + 'Task: parse a shopping request into structured search parameters.\n\nOutput schema (strict JSON, no code fence, no prose):\n{\n  "reasoning": "one-sentence summary of the extraction decisions you made",\n  "products": [{\n    "keywords":        "2-8 word search string",\n    "price_range":     "lo-hi" | "lo-" | "-hi" | null,\n    "service":         null | "official" | "freeShipping" | "COD" | "flashsale" | "<csv combination>",\n    "only_product_type": true | false,\n    "constraints":     {"attribute_key": "value", ...},\n    "hypothetical_title": "plausible seller-style product title (8-15 words)"\n  }],\n}\n\n' + LLM_PARSE_RULES_COMMON + 'Rules for constraints (required attribute map):\n  * Extract key-value pairs of product attributes explicitly named in the query: color, size, brand, material, pattern, style, type, model, year, closure, occasion, feature, compatibility, quantity, finish, capacity, dimension, etc.\n  * Use lowercase values. Only include attributes actually stated by the user (never infer).\n  * Empty object {} when no structured attributes are mentioned.\n\nRules for hypothetical_title:\n  * Write a plausible product title a seller would put on a listing that satisfies the query.\n  * Use seller-style vocabulary: include technical descriptors, compatibility cues, and functional terms (e.g. "Replacement Parts", "For X", "Original", "Ribbon", "Cable", "Cover", "Adjustable", "Professional") that sellers commonly add but users rarely say.\n  * 8-15 words, ASCII only, no markdown, no quotes inside.\n  * Use DIFFERENT wording than the raw query so a BM25 probe over this title surfaces seller vocabulary the user\'s phrasing missed.\n\nEmit JSON only.'
+LLM_PROMPT_PARSE_SAME_SHOP_MULTI = LLM_JSON_INPUT_PREAMBLE + 'Task: a shopping request names several distinct products the SAME shop must carry. Split it into one entry per product.\n\nOutput schema (strict JSON, no code fence, no prose):\n{\n  "reasoning": "one-sentence summary of how you segmented the query",\n  "products": [{\n    "query":           "the exact slice of the raw query describing this product",\n    "keywords":        "2-8 word search string",\n    "price_range":     "lo-hi" | "lo-" | "-hi" | null,\n    "service":         null | "official" | "freeShipping" | "COD" | "flashsale" | "<csv combination>",\n    "only_product_type": true | false,\n    "order":           "1st" | "2nd" | "3rd" | ...\n  }]\n}\n\n' + LLM_PARSE_RULES_COMMON + LLM_PARSE_RULES_PRODUCT_ORDER + 'Emit JSON only.'
+LLM_PROMPT_PARSE_VOUCHER_BUNDLE = LLM_JSON_INPUT_PREAMBLE + 'Task: a shopping request lists one or more products PLUS a voucher/budget constraint. Extract both.\n\nOutput schema (strict JSON, no code fence, no prose):\n{\n  "reasoning": "one-sentence summary of the voucher structure and the products you identified",\n  "products": [{\n    "query":           "the exact slice of the raw query describing this product",\n    "keywords":        "2-8 word search string",\n    "price_range":     "lo-hi" | "lo-" | "-hi" | null,\n    "service":         null | "official" | "freeShipping" | "COD" | "flashsale" | "<csv combination>",\n    "only_product_type": true | false,\n    "order":           "1st" | "2nd" | "3rd" | ...\n  }],\n  "voucher": {\n    "voucher_type":   "platform" | "shop",\n    "discount_type":  "fixed" | "percentage",\n    "discount_value": <number>,\n    "threshold":      <number, minimum spend required>,\n    "cap":            <number, max discount for percentage; 0 when not stated or fixed type>,\n    "budget":         <number, user\'s maximum out-of-pocket>\n  },\n  "is_shop_voucher": true | false\n}\n\n' + LLM_PARSE_RULES_COMMON + LLM_PARSE_RULES_PRODUCT_ORDER + 'Rules for the voucher block:\n  * "42% off" -> discount_type=percentage, discount_value=42.\n  * "PHP 50 off" -> discount_type=fixed, discount_value=50.\n  * threshold defaults to 0 when no minimum is stated.\n  * cap = 0 whenever the voucher is fixed-value or no cap is mentioned.\n  * budget is the user\'s total spending limit BEFORE the voucher applies.\n\nRules for is_shop_voucher:\n  * true when the voucher says the items must come from the same shop; false otherwise.\n\nEmit JSON only.'
+LLM_PROMPT_SCORE_CANDIDATE_BATCH = 'Role: candidate-relevance scorer for a multi-product shop-matching task.\n\nInput:  JSON with "request" (the user\'s description), a list of "candidates" (product summaries), and a boolean "only_product_type".\nOutput: JSON ARRAY, one object per candidate in the order received, each with an integer "score" from 0 (no match) to 10 (perfect match).\n\nScoring guidance:\n  * Attributes and sku_options are more trustworthy than the product title. The title can be padded with generic terms.\n  * When the request says "any X", treat it the same as "all X" ? any candidate value satisfies it.\n  * Weigh these factors when present: model/compatibility, material, theme/function, brand, quantity, weight/volume, dimensions, style/fit/length, use-case, service tags, price.\n  * Treat formatting differences (spacing, punctuation, synonyms) as equivalent matches.\n  * When "only_product_type" is true, inspect sku_options and attributes for a "product_type + only" variant ? do not look for it in the title.\n  * Do not reward a candidate just because its title is longer or has more generic matching words.\n  * When multiple candidates equally satisfy one dimension, prefer the one with broader consistency across all other dimensions.\n\nOutput shape (no markdown):\n[{"product_id":<id>,"score":<0-10>}, ...]'
+LLM_PROMPT_JUDGE_BEST_LISTING = 'Task: identify the single best candidate product for a shopping request, graded by how exactly the candidate matches what the user asked for.\n\nInputs come as a JSON object with `request` (raw user text), a list of `candidates` (each carrying title, price, service flags, attributes, and a trimmed sku_options_preview), and a boolean `only_product_type`.\n\nJudging principles, applied in order:\n\n(a) Structured signals carry more weight than title prose. The catalogue\'s attributes and sku_options are the seller\'s own labelling and are the source of truth when deciding whether a candidate genuinely carries a requested property.\n\n(b) Each stated user requirement must be accounted for ? compatibility/model, brand, material, colour, quantity/units, weight/volume, dimensions, packaging, fit, style, length, use-case, service tags, and price range all count.\n\n(c) Do not upgrade a candidate just because its title is denser in query words or uses broader generic terms. Title word-count is not evidence.\n\n(d) Treat slight formatting, spacing, punctuation, or tokenisation differences between the user\'s phrasing and the catalogue value as equivalent matches.\n\n(e) When two candidates both clearly satisfy the main requirement, prefer the one whose title + attributes + sku_options agree MORE consistently end-to-end, not the one that happens to pile extra words onto a single attractive field.\n\n(f) When `only_product_type` is true, the bare product type must appear as an `only` variant inside sku_options or attributes. Title-only evidence is insufficient.\n\n(g) Price is a last-resort tiebreaker. Never downgrade a stronger-matching candidate because a weaker one happens to be cheaper.\n\nScoring rubric for `relevance_score` (integer 0 through 10):\n  10 ? every hard requirement satisfied exactly (product type, attributes, sku_options, service, price).\n  8-9 ? every hard requirement satisfied; only cosmetic wording differences remain.\n  6-7 ? most requirements satisfied; exactly one non-critical attribute is unverified.\n  4-5 ? core product type is right but at least one stated attribute or sku value is unsatisfied or unverifiable.\n  2-3 ? partial product-type match with multiple misses.\n  0-1 ? wrong product type or off-target.\n\nBefore settling on the final score, subtract each applicable penalty:\n  -4 when the candidate\'s price falls outside the requested range.\n  -3 for each required service tag the candidate does not offer.\n  -5 when `only_product_type` is true but the product type is qualified (extra attributes attached).\n  -2 for each key attribute that contradicts the request (brand, model, size, material, etc.).\n\nOutput strict JSON, no markdown fences, no prose:\n{\n  "best_product_id": <id>,\n  "reason":          "1-2 sentences citing the specific attribute or sku_option values that decided it",\n  "relevance_score": <integer 0-10>\n}'
+HTTP_JOURNAL_ROW_FIELD_ORDER = ('method', 'path', 'status_code', 'duration_ms', 'timestamp', 'params', 'json_data', 'response', 'completion_tokens', 'result_product_ids')
+thread_local_http_journal_buffer = threading.local()
+SPEC_RICHNESS_RANK_WORST_SENTINEL = 10000
+EMPTY_SHOP_ANCHOR_CANDIDATE_CAP = 8
+EMPTY_SHOP_ANCHOR_CAP_UNDER_VOUCHER = 4
+LLM_PARSE_PROMPT_BY_TASK_KIND: dict[str, str] = {'product': LLM_PROMPT_PARSE_SINGLE_PRODUCT, 'shop': LLM_PROMPT_PARSE_SAME_SHOP_MULTI, 'voucher': LLM_PROMPT_PARSE_VOUCHER_BUNDLE}
+LLM_PARSE_MODEL_BY_TASK_KIND: dict[str, str] = {'product': INFERENCE_MODEL_REGISTRY['PRODUCT_PARSE_MODEL'], 'shop': INFERENCE_MODEL_REGISTRY['SHOP_PARSE_MODEL'], 'voucher': INFERENCE_MODEL_REGISTRY['VOUCHER_PARSE_MODEL']}
+
+@dataclass
+class DialogueRunState:
+    pipeline_start_time: float = 0.0
+    product_detail_cache: dict[str, dict] = field(default_factory=dict)
+    last_tool_call_timestamp: float = 0.0
+    out_of_pool_alt_cache: dict = field(default_factory=dict)
+
+    def reset_for_run(self) -> None:
+        self.pipeline_start_time = time.monotonic()
+        self.last_tool_call_timestamp = 0.0
+        self.product_detail_cache.clear()
+        self.out_of_pool_alt_cache.clear()
+dialogue_run_state = DialogueRunState()
+
+class RequestsPerMinuteGate:
+
+    def __init__(self, max_rpm: int, window: float, min_gap: float) -> None:
+        self.max_rpm = max_rpm
+        self.window = window
+        self.min_gap = min_gap
+        self.history: list[float] = []
+        self.lock = threading.Lock()
+
+    def compute_delay(self, now: float) -> float:
+        expiry = now - self.window
+        while self.history and self.history[0] <= expiry:
+            self.history.pop(0)
+        delay = 0.0
+        if self.history:
+            gap = now - self.history[-1]
+            if gap < self.min_gap:
+                delay = self.min_gap - gap
+        if len(self.history) >= self.max_rpm:
+            delay = max(delay, self.window - (now - self.history[0]))
+        return delay
+
+    def acquire(self) -> None:
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                wait = self.compute_delay(now)
+                if wait <= 0:
+                    self.history.append(now)
+                    return
+            time.sleep(wait)
+
+class JournalingProxyHttpClient:
+
+    def __init__(self, upstream: ProxyClient, label: str) -> None:
+        self.upstream = upstream
+        self.label = label
+
+    def __getattr__(self, name: str):
+        return getattr(self.upstream, name)
+
+    def roundtrip(self, method: str, path: str, params: Any=None, json_data: Any=None, **kw):
+        t0 = time.time()
+        resp = None
+        try:
+            if method == 'POST':
+                resp = self.upstream.post(path, json_data=json_data, **kw)
+            else:
+                resp = self.upstream.get(path, params=params, **kw)
+            return resp
+        finally:
+            _AgentCore.append_http_roundtrip_journal_event(self.label, method, path, (time.time() - t0) * 1000, resp, params=params, json_data=json_data)
+
+    def post(self, path: str, json_data=None, **kw):
+        return self.roundtrip('POST', path, json_data=json_data, **kw)
+
+    def get(self, path: str, params=None, **kw):
+        return self.roundtrip('GET', path, params=params, **kw)
+
+class SameShopMultiSpecBundle(NamedTuple):
+    shop_id: str
+    product_ids: list[str]
+    think: str
+    leader_products: list[dict]
+    candidate_product_ids_by_spec: list[list[str]]
+    all_candidate_product_ids: list[str]
+
+class _DialoguePhaseTimer:
+    __slots__ = ('label', '_t0', 'elapsed_ms', 'completed')
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self._t0 = 0.0
+        self.elapsed_ms = 0.0
+        self.completed = False
+
+    def __enter__(self) -> '_DialoguePhaseTimer':
+        self._t0 = time.monotonic()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.elapsed_ms = (time.monotonic() - self._t0) * 1000.0
+        self.completed = True
+
+    def as_snapshot(self) -> dict[str, Any]:
+        return {'label': self.label, 'elapsed_ms': round(self.elapsed_ms, 2), 'completed': self.completed}
+
+@dataclass(frozen=True)
+class _PriceBoundsTuple:
+    lo: float | None = None
+    hi: float | None = None
+
+    @classmethod
+    def from_text(cls, raw: str | None) -> '_PriceBoundsTuple':
+        if not raw:
+            return cls(None, None)
+        lo, hi = _AgentCore.parse_hyphenated_price_range_bounds(str(raw))
+        return cls(lo, hi)
+
+    def is_open(self) -> bool:
+        return self.lo is None and self.hi is None
+
+    def contains(self, price: float, *, tolerance: float=1e-09) -> bool:
+        if self.lo is not None and price < self.lo - tolerance:
+            return False
+        if self.hi is not None and price > self.hi + tolerance:
+            return False
+        return True
+
+    def midpoint_or_none(self) -> float | None:
+        if self.lo is None or self.hi is None:
+            return None
+        return (self.lo + self.hi) / 2.0
+
+@dataclass(frozen=True)
+class _ServiceTagSet:
+    tags: frozenset[str] = field(default_factory=frozenset)
+
+    @classmethod
+    def from_csv(cls, raw: str | None) -> '_ServiceTagSet':
+        normalized = _AgentCore.normalize_catalog_service_csv_filter(raw)
+        if not normalized:
+            return cls(frozenset())
+        return cls(frozenset((p.strip() for p in normalized.split(',') if p.strip())))
+
+    @classmethod
+    def from_listing(cls, listing: dict[str, Any]) -> '_ServiceTagSet':
+        return cls(frozenset(_AgentCore.listing_service_tags_set(listing)))
+
+    def as_csv(self) -> str | None:
+        return ','.join(sorted(self.tags)) if self.tags else None
+
+    def covers(self, required: '_ServiceTagSet') -> bool:
+        return required.tags.issubset(self.tags)
+
+    def __bool__(self) -> bool:
+        return bool(self.tags)
+
+class _ProductIdLedger:
+    __slots__ = ('_seen', '_order')
+
+    def __init__(self) -> None:
+        self._seen: set[str] = set()
+        self._order: list[str] = []
+
+    def offer(self, raw: Any) -> bool:
+        pid = str(raw or '').strip()
+        if not pid or pid in self._seen:
+            return False
+        self._seen.add(pid)
+        self._order.append(pid)
+        return True
+
+    def extend(self, raws: Sequence[Any]) -> int:
+        added = 0
+        idx = 0
+        while idx < len(raws):
+            if self.offer(raws[idx]):
+                added += 1
+            idx += 1
+        return added
+
+    def as_list(self) -> list[str]:
+        return list(self._order)
+
+    def __len__(self) -> int:
+        return len(self._order)
+
+    def __contains__(self, raw: Any) -> bool:
+        return str(raw or '').strip() in self._seen
+
+    def __iter__(self):
+        return iter(self._order)
+
+class _CandidatePoolMerger:
+    __slots__ = ('pool', 'seen')
+
+    def __init__(self, *, initial_pool: list[dict] | None=None, initial_seen: set[str] | None=None) -> None:
+        self.pool: list[dict] = initial_pool if initial_pool is not None else []
+        self.seen: set[str] = initial_seen if initial_seen is not None else set()
+
+    def merge_payload(self, payload: dict | None) -> int:
+        before = len(self.pool)
+        _AgentCore.merge_find_product_hits_into_candidate_pool(payload or {}, self.pool, self.seen)
+        return len(self.pool) - before
+
+    def merge_many(self, payloads: Sequence[dict]) -> int:
+        delta = 0
+        idx = 0
+        while idx < len(payloads):
+            delta += self.merge_payload(payloads[idx])
+            idx += 1
+        return delta
+
+    def size(self) -> int:
+        return len(self.pool)
+
+@dataclass
+class _VoucherMathSnapshot:
+    total: float = 0.0
+    discount: float = 0.0
+    total_after: float = 0.0
+    applied: bool = False
+    within_budget: bool = False
+
+    @classmethod
+    def evaluate(cls, prices: Sequence[float], voucher: dict) -> '_VoucherMathSnapshot':
+        raw = _AgentCore.compute_voucher_cart_math(list(prices), voucher)
+        return cls(total=float(raw.get('total', 0.0)), discount=float(raw.get('discount', 0.0)), total_after=float(raw.get('total_after', 0.0)), applied=bool(raw.get('applied', False)), within_budget=bool(raw.get('within_budget', False)))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {'total': self.total, 'discount': self.discount, 'total_after': self.total_after, 'applied': self.applied, 'within_budget': self.within_budget}
+
+    def utilisation_against(self, budget: float) -> float:
+        return _AgentCore.voucher_utilisation_sort_key(self.total_after, budget)
+
+class _QueryHintExtractor:
+    __slots__ = ('query', '_hints')
+
+    def __init__(self, query: str) -> None:
+        self.query = query or ''
+        self._hints: dict[str, Any] | None = None
+
+    def _ensure(self) -> dict[str, Any]:
+        if self._hints is None:
+            self._hints = _AgentCore.build_parse_regex_hints_from_query(self.query)
+        return self._hints
+
+    @property
+    def quoted_literals(self) -> list[str]:
+        return list(self._ensure().get('quoted_literals') or [])
+
+    @property
+    def number_unit_tokens(self) -> list[str]:
+        return list(self._ensure().get('number_unit_tokens') or [])
+
+    @property
+    def size_labels(self) -> list[str]:
+        return list(self._ensure().get('size_labels') or [])
+
+    @property
+    def color_words(self) -> list[str]:
+        return list(self._ensure().get('color_words') or [])
+
+    @property
+    def service_tags(self) -> list[str]:
+        return list(self._ensure().get('service_tags') or [])
+
+    def as_payload(self) -> dict[str, Any]:
+        return dict(self._ensure())
+
+class _ModelChainRoster:
+
+    @staticmethod
+    def for_role(role: str, *, fallback_model: str | None=None) -> list[str]:
+        resolver_map = {'pick': lambda: _AgentCore.active_llm_model_chain_for_pick(), 'batch_score': lambda: _AgentCore.active_llm_model_chain_for_batch_score()}
+        resolver = resolver_map.get(role)
+        if resolver is not None:
+            return list(resolver())
+        if fallback_model is None:
+            fallback_model = INFERENCE_MODEL_REGISTRY['BACKUP_LLM_MODEL']
+        return list(_AgentCore.llm_model_ids_with_role_fallback(fallback_model))
+
+class _DialogueRunMetricsObserver:
+    __slots__ = ('_phase_snapshots',)
+
+    def __init__(self) -> None:
+        self._phase_snapshots: list[dict[str, Any]] = []
+
+    def record(self, timer: '_DialoguePhaseTimer') -> None:
+        if timer is None or not timer.completed:
+            return
+        self._phase_snapshots.append(timer.as_snapshot())
+
+    def aggregate_ms(self) -> float:
+        running_total = 0.0
+        for snap in self._phase_snapshots:
+            running_total += float(snap.get('elapsed_ms') or 0.0)
+        return round(running_total, 2)
+
+    def as_payload(self) -> dict[str, Any]:
+        return {'phase_count': len(self._phase_snapshots), 'aggregate_ms': self.aggregate_ms(), 'phases': list(self._phase_snapshots)}
+
+class _ConstraintCoverageProbe:
+    __slots__ = ('constraints',)
+
+    def __init__(self, constraints: dict | None) -> None:
+        self.constraints = constraints or {}
+
+    def is_trivial(self) -> bool:
+        return not self.constraints
+
+    def score_for(self, product: dict, detail: dict | None) -> float:
+        if self.is_trivial():
+            return 1.0
+        return _AgentCore.weighted_constraint_coverage_score(product, detail, self.constraints)
+
+    def gap_against(self, baseline: float, challenger: float) -> float:
+        return round(challenger - baseline, 4)
+
+class DialogueRunContext:
+
+    def __init__(self) -> None:
+        self.steps: list[dict] = []
+        self.query: str = ''
+        self.metrics: _DialogueRunMetricsObserver = _DialogueRunMetricsObserver()
+
+class SingleProductRecommendationFlow:
+
+    class EarlyRecommendationSuccessAbort(Exception):
+        pass
+    __slots__ = ('ctx', 'params', 'spec', 'catalog_search_params', 'constraints', 'unique', 'seen', 'scored_candidates', 'best', 'judge_relevance_score', 'meets_fast_accept_threshold')
+
+    def __init__(self, ctx: 'DialogueRunContext', params: dict) -> None:
+        self.ctx = ctx
+        self.params = params
+        specs = params.get('products', [{}])
+        self.spec = specs[0] if specs else {}
+        self.catalog_search_params = _AgentCore.parsed_spec_to_find_product_params(self.spec)
+        self.constraints = self.spec.get('constraints') or {}
+        self.unique: list[dict] = []
+        self.seen: set[str] = set()
+        self.scored_candidates: list[tuple[dict, float]] | None = None
+        self.best: dict | None = None
+        self.judge_relevance_score = 0.0
+        self.meets_fast_accept_threshold = False
+
+    def log_single_product_flow_start(self) -> None:
+        pass
+
+    def stage_initial_catalog_search(self) -> None:
+        phase1_calls: list = []
+        r1 = _AgentCore.invoke_sandbox_tool_with_gap_and_retry('find_product', {**self.catalog_search_params, 'page': 1})
+        phase1_calls.append(r1)
+        _AgentCore.merge_find_product_hits_into_candidate_pool(r1, self.unique, self.seen)
+        top_preview = [{'title': r.get('title', ''), 'price': r.get('price'), 'product_id': str(r.get('product_id', '') or '')} for r in self.unique[:5]]
+        think_search = _AgentCore.format_dialogue_step_reasoning_text(self.ctx.query, {'search_query': self.catalog_search_params.get('q', ''), 'price_filter': self.catalog_search_params.get('price'), 'service_filter': self.catalog_search_params.get('service'), 'total_results': len(self.unique), 'top_candidates': top_preview, 'hypothetical_title': self.spec.get('hypothetical_title'), 'constraints': self.constraints}, fallback=f"Phase 1 ? initial catalog search. I issued `find_product` for '{self.catalog_search_params.get('q', '')}' (price={self.catalog_search_params.get('price', 'any')}, service={self.catalog_search_params.get('service', 'any')}) with page=1 only. Starting with a single page is intentional: if the LLM judge scores the top result at ?{LLM_JUDGE_FAST_ACCEPT_SCORE_THRESHOLD}/10 we fast-accept and skip the more expensive broadening calls, saving latency and budget. Page 1 returned {len(self.unique)} unique candidates. Top candidates by position: {top_preview}. " + (f"The parser's hypothetical seller title ('{self.spec.get('hypothetical_title', '')}') is available as a secondary probe query if the pool stays small. " if self.spec.get('hypothetical_title') else '') + (f'Structured constraints to satisfy: {self.constraints}. ' if self.constraints else ''))
+        _AgentCore.append_dialogue_step_with_tool_results(self.ctx, think_search, phase1_calls)
+
+    def stage_initial_llm_judge(self) -> None:
+        self.best = _AgentCore.llm_judge_best_from_candidate_pool(self.ctx.query, self.unique, self.spec)
+        self.judge_relevance_score = float(self.best.get('_llm_relevance_score', 0.0)) if self.best else 0.0
+        self.meets_fast_accept_threshold = bool(self.best) and self.judge_relevance_score >= LLM_JUDGE_FAST_ACCEPT_SCORE_THRESHOLD
+
+    def stage_narrate_judge_branch_decision(self) -> None:
+        _judge_pid = str(self.best.get('product_id', '') or '') if self.best else 'none'
+        _judge_title = str(self.best.get('title', '') or '')[:80] if self.best else ''
+        _judge_price = self.best.get('price') if self.best else None
+        if self.meets_fast_accept_threshold:
+            _decision_branch = 'fast_accept'
+            _decision_reason = f'The LLM judge scored the leading candidate pid={_judge_pid} (\'{_judge_title}\' @ ?{_judge_price}) at {self.judge_relevance_score:.1f}/10, which meets the fast-accept threshold of {LLM_JUDGE_FAST_ACCEPT_SCORE_THRESHOLD}. Decision: fast-accept this pick. A single verification probe with an adapted query will be run next (HyDE seller-vocab / drop service / shorten keywords / page 2) to cross-check the pick against listings the original query may have missed, but the winner is already provisionally chosen.'
+        elif not self.best:
+            _decision_branch = 'broaden_no_pick'
+            _decision_reason = f'The LLM judge found no scoreable candidates on page 1. Decision: enter full broadening phase ? page 2, service relaxation, short-keyword trim, and HyDE probe.'
+        else:
+            _decision_branch = 'broaden_low_score'
+            _decision_reason = f'The LLM judge scored the leading candidate pid={_judge_pid} (\'{_judge_title}\' @ ?{_judge_price}) at {self.judge_relevance_score:.1f}/10, which is at or below the low-confidence threshold of {LLM_JUDGE_LOW_CONFIDENCE_SCORE_THRESHOLD}. Decision: do not fast-accept. Enter broadening phase to widen the candidate pool before re-judging: page 2 adds fresher listings; dropping the service filter tests whether the constraint is too narrow; the short-keyword probe catches sellers using abbreviated titles; the HyDE probe uses seller-style vocabulary from the parser\'s hypothetical title to surface results user phrasing misses.'
+        think_judge_decision = _AgentCore.format_dialogue_step_reasoning_text(self.ctx.query, {'judge_decision': {'product_id': _judge_pid, 'title': _judge_title, 'price': _judge_price, 'score': round(self.judge_relevance_score, 1)}, 'branch': _decision_branch, 'fast_accept_score_threshold': LLM_JUDGE_FAST_ACCEPT_SCORE_THRESHOLD, 'low_score_threshold': LLM_JUDGE_LOW_CONFIDENCE_SCORE_THRESHOLD, 'reasoning': _decision_reason}, fallback=_decision_reason)
+        _AgentCore.append_dialogue_step_with_tool_results(self.ctx, think_judge_decision, [])
+
+    def stage_optional_verification_probes(self) -> None:
+        if self.meets_fast_accept_threshold and _AgentCore.single_product_may_run_probe_by_time():
+            _AgentCore.run_fast_accept_verification_probes(self.ctx, self.spec, self.catalog_search_params, self.best, self.judge_relevance_score, self.unique, self.seen)
+
+    def stage_broaden_pool_and_rejudge(self) -> None:
+        if not (not self.meets_fast_accept_threshold and (not self.best or self.judge_relevance_score <= LLM_JUDGE_LOW_CONFIDENCE_SCORE_THRESHOLD)):
+            return
+        phase2_calls: list = []
+        probes_allowed = _AgentCore.single_product_may_run_probe_by_time()
+        if probes_allowed:
+            r2 = _AgentCore.invoke_sandbox_tool_with_gap_and_retry('find_product', {**self.catalog_search_params, 'page': 2})
+            phase2_calls.append(r2)
+            _AgentCore.merge_find_product_hits_into_candidate_pool(r2, self.unique, self.seen)
+            if self.catalog_search_params.get('service'):
+                relaxed = {k: v for k, v in self.catalog_search_params.items() if k != 'service'}
+                rr = _AgentCore.invoke_sandbox_tool_with_gap_and_retry('find_product', {**relaxed, 'page': 1})
+                phase2_calls.append(rr)
+                _AgentCore.merge_find_product_hits_into_candidate_pool(rr, self.unique, self.seen)
+            q_raw = (self.catalog_search_params.get('q') or '').replace(' only', '').strip()
+            words = q_raw.split()
+            if len(words) > 2:
+                rs = _AgentCore.invoke_sandbox_tool_with_gap_and_retry('find_product', {'q': ' '.join(words[:2]), 'page': 1})
+                phase2_calls.append(rs)
+                _AgentCore.merge_find_product_hits_into_candidate_pool(rs, self.unique, self.seen)
+            if len(self.unique) < 10:
+                hyde_q = _AgentCore.build_seller_vocabulary_hyde_probe_query(self.spec)
+                api_q_norm = (self.catalog_search_params.get('q') or '').lower()
+                if hyde_q and hyde_q != api_q_norm:
+                    hyde_params: dict = {'q': hyde_q, 'page': 1}
+                    if self.catalog_search_params.get('price'):
+                        hyde_params['price'] = self.catalog_search_params['price']
+                    rh = _AgentCore.invoke_sandbox_tool_with_gap_and_retry('find_product', hyde_params)
+                    phase2_calls.append(rh)
+                    _AgentCore.merge_find_product_hits_into_candidate_pool(rh, self.unique, self.seen)
+            if SINGLE_PRODUCT_ENABLE_THIRD_PAGE:
+                r3 = _AgentCore.invoke_sandbox_tool_with_gap_and_retry('find_product', {**self.catalog_search_params, 'page': 3})
+                phase2_calls.append(r3)
+                _AgentCore.merge_find_product_hits_into_candidate_pool(r3, self.unique, self.seen)
+            if SINGLE_PRODUCT_ENABLE_ALT_QUERY_PROBE:
+                alt_slug = _AgentCore.alternate_query_slug_from_spec(self.spec)
+                base_q = (self.catalog_search_params.get('q') or '').strip().lower()
+                if alt_slug and alt_slug.lower() != base_q:
+                    alt_params: dict = {'q': alt_slug, 'page': 1}
+                    if self.catalog_search_params.get('price'):
+                        alt_params['price'] = self.catalog_search_params['price']
+                    ra = _AgentCore.invoke_sandbox_tool_with_gap_and_retry('find_product', alt_params)
+                    phase2_calls.append(ra)
+                    _AgentCore.merge_find_product_hits_into_candidate_pool(ra, self.unique, self.seen)
+        _probes_run: list[str] = []
+        if probes_allowed:
+            _probes_run.append('page 2 of the same query (catches new listings or pagination gaps)')
+            if self.catalog_search_params.get('service'):
+                _probes_run.append(f"service-filter dropped (original filter '{self.catalog_search_params.get('service')}' may be too narrow; testing broader inventory)")
+            if len((self.catalog_search_params.get('q') or '').replace(' only', '').split()) > 2:
+                _probes_run.append("short 2-word keyword query (sellers often use abbreviated titles that don't match the full keyword string)")
+            if len(self.unique) < 10:
+                _probes_run.append(f"HyDE seller-vocabulary probe ('{self.spec.get('hypothetical_title', 'n/a')}' ? extracted tokens): uses the parser-generated seller-style title to surface listings written in trade vocabulary the user didn't use")
+            if SINGLE_PRODUCT_ENABLE_THIRD_PAGE:
+                _probes_run.append('page 3 of the primary query (deeper pagination)')
+            if SINGLE_PRODUCT_ENABLE_ALT_QUERY_PROBE:
+                _probes_run.append('alternate query slug from full user text (when keywords omit query tokens)')
+        _broaden_intro = f'Low-confidence judge score ({self.judge_relevance_score:.1f} ? {LLM_JUDGE_LOW_CONFIDENCE_SCORE_THRESHOLD}) on page 1. ' if self.best else 'No usable candidates on page 1. '
+        if not probes_allowed:
+            _broaden_body = f'Broadening was skipped because elapsed time passed {SINGLE_PRODUCT_PROBE_MAX_ELAPSED_SECONDS:.0f}s ? running under the session deadline. Using whatever was found so far ({len(self.unique)} candidates).'
+        else:
+            _broaden_body = f'Running {len(_probes_run)} broadening probe(s) in sequence: ' + '; '.join((f'({i + 1}) {p}' for i, p in enumerate(_probes_run))) + f'. Each probe\'s hits are deduplicated by product_id and merged into the pool. After broadening the pool contains {len(self.unique)} distinct products. The LLM judge will re-rank the entire merged pool to select the final winner.'
+        fallback_broaden = _broaden_intro + _broaden_body
+        think_broaden = _AgentCore.format_dialogue_step_reasoning_text(self.ctx.query, {'search_query': self.catalog_search_params.get('q', ''), 'broaden_reason': _broaden_intro.strip(), 'probes_run': _probes_run, 'total_results_after_broadening': len(self.unique), 'constraints': self.constraints, 'probes_skipped_deadline': not probes_allowed}, fallback=fallback_broaden)
+        _AgentCore.append_dialogue_step_with_tool_results(self.ctx, think_broaden, phase2_calls)
+        constraints_meaningful = isinstance(self.constraints, dict) and len(self.constraints) >= 2
+        cap_slice = self.unique[:SINGLE_PRODUCT_BATCH_LLM_SCORE_CAP]
+        if self.unique and constraints_meaningful and _AgentCore.single_product_may_finalize_by_time():
+            cand_pids = [str(p.get('product_id', '') or '') for p in cap_slice if p.get('product_id')]
+            _AgentCore.fetch_and_cache_catalog_product_details(cand_pids)
+            self.scored_candidates = _AgentCore.llm_score_listing_batch(str(self.spec.get('query') or self.spec.get('keywords') or self.ctx.query), cap_slice, dialogue_run_state.product_detail_cache, only_product_type=bool(self.spec.get('only_product_type', False)))
+        self.best = _AgentCore.llm_judge_best_from_candidate_pool(self.ctx.query, self.unique, self.spec)
+
+    def stage_narrate_attribute_coverage_gate(self) -> None:
+        _pre_gate_pid = str(self.best.get('product_id', '') or '') if self.best else None
+        self.best = _AgentCore.apply_structured_attribute_coverage_gate(self.spec, self.best, self.scored_candidates)
+        _post_gate_pid = str(self.best.get('product_id', '') or '') if self.best else None
+        if self.best is not None and _pre_gate_pid is not None and (_post_gate_pid != _pre_gate_pid) and self.scored_candidates:
+            _gate_pre_cov = _AgentCore.weighted_constraint_coverage_score(next((p for p, _ in self.scored_candidates if str(p.get('product_id', '')) == _pre_gate_pid), {}), dialogue_run_state.product_detail_cache.get(_pre_gate_pid, {}), self.spec.get('constraints') or {})
+            _gate_post_cov = _AgentCore.weighted_constraint_coverage_score(self.best, dialogue_run_state.product_detail_cache.get(_post_gate_pid, {}), self.spec.get('constraints') or {})
+            think_gate = _AgentCore.format_dialogue_step_reasoning_text(self.ctx.query, {'coverage_gate': {'replaced_pid': _pre_gate_pid, 'replaced_coverage': round(_gate_pre_cov, 2), 'new_pid': _post_gate_pid, 'new_coverage': round(_gate_post_cov, 2), 'constraints': self.spec.get('constraints') or {}}, 'reasoning': f'The attribute-coverage gate fired: the LLM judge\'s pick (pid={_pre_gate_pid}) had a relevance score below 8.0 AND satisfied only {_gate_pre_cov * 100:.0f}% of the structured constraints. A challenger (pid={_post_gate_pid}) was found in the batch-scored pool with coverage {_gate_post_cov * 100:.0f}% ? at least 30 percentage points higher and a batch score ? 6.0. The gate swaps the winner to the challenger because attribute coverage (brand, color, material, size, etc.) is a more reliable signal than title-keyword overlap alone when the judge is uncertain.'}, fallback=f"Attribute-coverage gate: the initial judge pick (pid={_pre_gate_pid}, coverage={_gate_pre_cov * 100:.0f}%) was replaced by pid={_post_gate_pid} (coverage={_gate_post_cov * 100:.0f}%) because the challenger satisfies significantly more of the structured constraints {self.spec.get('constraints') or {}} while still scoring ? 6.0 on the batch scorer. Coverage is measured as the fraction of constraint values that appear in the candidate's title, attributes, or SKU options.")
+            _AgentCore.append_dialogue_step_with_tool_results(self.ctx, think_gate, [])
+
+    def stage_abort_when_no_acceptable_listing(self) -> None:
+        if self.best and (not _AgentCore.listing_meets_parsed_spec(self.best, self.spec)):
+            self.best = None
+        if self.best:
+            return
+        _AgentCore.finalize_dialogue_with_product_recommendation(self.ctx, [NO_MATCH_PRODUCT_ID_SENTINEL], 'failure', think='No suitable product matched the constraints.')
+        raise SingleProductRecommendationFlow.EarlyRecommendationSuccessAbort
+
+    def stage_finalize_successful_recommendation(self) -> None:
+        pid = str(self.best.get('product_id', '') or '')
+        _AgentCore.append_single_product_alternatives_weighing_step(self.ctx, self.best, self.unique, self.spec)
+        constraint_check = _AgentCore.audit_selected_listing_against_spec(title=self.best.get('title', ''), price=self.best.get('price'), parsed_spec=self.spec)
+        final_alts = _AgentCore.top_alternate_listings_for_narration(self.best, self.unique, self.spec, self.ctx.query, n=2, with_title=True)
+        out_alt = _AgentCore.out_of_pool_comparison_alt(self.best, self.spec, self.ctx.query, self.seen)
+        gate4_alts = [out_alt] if out_alt is not None else final_alts
+        compare_clause = _AgentCore.format_single_product_comparison_clause(self.best, gate4_alts, self.ctx.query, self.spec)
+        llm_reason = str(self.best.get('_llm_reason', '') or '').strip()
+        _cc_note = ''
+        if constraint_check:
+            _matched = constraint_check.get('keywords_matched') or []
+            _missing = constraint_check.get('keywords_missing') or []
+            _price_note = constraint_check.get('price_note') or ''
+            _overall = constraint_check.get('overall_note') or ''
+            _cc_note = f' Keyword check: matched={_matched}' + (f', missing={_missing}' if _missing else ', no missing keywords') + f'. Price check: {_price_note}. Overall: {_overall}.'
+        fb_text = f"Final selection: product_id={pid} title='{str(self.best.get('title', ''))[:100]}' price={self.best.get('price')} service={self.best.get('service')}. " + (f'LLM judge reason: \'{llm_reason}\'. ' if llm_reason else 'No LLM reason recorded ? winner chosen by heuristic score ranking. ') + _cc_note + compare_clause
+        detail = dialogue_run_state.product_detail_cache.get(pid, {})
+        think_sel = _AgentCore.format_dialogue_step_reasoning_text(self.ctx.query, {'selected': {'product_id': pid, 'title': self.best.get('title', ''), 'price': self.best.get('price'), 'service': self.best.get('service'), 'attributes': detail.get('attributes', {}) if isinstance(detail, dict) else {}, 'sku_options_sample': list((detail.get('sku_options', {}) if isinstance(detail, dict) else {}).values())[:3]}, 'constraints': {'price_range': self.spec.get('price_range'), 'service': self.spec.get('service'), 'keywords': self.spec.get('keywords'), 'required_attrs': self.constraints}, 'constraint_check': constraint_check, 'alternatives': final_alts, 'llm_reason': llm_reason}, fallback=fb_text)
+        _AgentCore.finalize_dialogue_with_product_recommendation(self.ctx, [pid], 'success', think=think_sel, llm_reason=llm_reason)
+
+    def execute_recommendation_flow(self) -> None:
+        try:
+            self.log_single_product_flow_start()
+            self.stage_initial_catalog_search()
+            self.stage_initial_llm_judge()
+            self.stage_narrate_judge_branch_decision()
+            self.stage_optional_verification_probes()
+            self.stage_broaden_pool_and_rejudge()
+            self.stage_narrate_attribute_coverage_gate()
+            self.stage_abort_when_no_acceptable_listing()
+            self.stage_finalize_successful_recommendation()
+        except SingleProductRecommendationFlow.EarlyRecommendationSuccessAbort:
+            return
+acquire_catalog_http_rate_limit_slot = RequestsPerMinuteGate(CATALOG_HTTP_MAX_REQUESTS_PER_MINUTE, RATE_LIMIT_WINDOW_SECONDS, MIN_SECONDS_BETWEEN_CATALOG_CALLS).acquire
+journaling_llm_inference_proxy_client = JournalingProxyHttpClient(ProxyClient(timeout=120, max_retries=3), 'inference')
+journaling_catalog_search_proxy_client = JournalingProxyHttpClient(ProxyClient(timeout=16, max_retries=2), 'search')
+
+class _CatalogQueryComposer:
+    __slots__ = ('_payload',)
+
+    def __init__(self, payload: dict[str, Any] | None=None) -> None:
+        self._payload = dict(payload or {})
+
+    @classmethod
+    def from_parsed_spec(cls, spec: dict[str, Any], *, include_price: bool=True) -> '_CatalogQueryComposer':
+        return cls(_AgentCore.parsed_spec_to_find_product_params(spec, include_price=include_price))
+
+    def with_page(self, page: int) -> '_CatalogQueryComposer':
+        self._payload['page'] = int(page)
+        return self
+
+    def with_shop(self, shop_id: str | None) -> '_CatalogQueryComposer':
+        if shop_id:
+            self._payload['shop_id'] = str(shop_id)
+        else:
+            self._payload.pop('shop_id', None)
+        return self
+
+    def with_price_band(self, band: str | None) -> '_CatalogQueryComposer':
+        if band:
+            self._payload['price'] = band
+        else:
+            self._payload.pop('price', None)
+        return self
+
+    def without_service(self) -> '_CatalogQueryComposer':
+        self._payload.pop('service', None)
+        return self
+
+    def override_keywords(self, raw: str) -> '_CatalogQueryComposer':
+        if raw:
+            self._payload['q'] = raw
+        return self
+
+    def as_dict(self) -> dict[str, Any]:
+        return dict(self._payload)
+
+class _ListingProbeRunner:
+    __slots__ = ('params', '_response')
+
+    def __init__(self, params: dict[str, Any]) -> None:
+        self.params = dict(params or {})
+        self._response: dict[str, Any] | None = None
+
+    def fetch(self) -> '_ListingProbeRunner':
+        self._response = _AgentCore.invoke_sandbox_tool_with_gap_and_retry('find_product', self.params)
+        return self
+
+    @property
+    def response(self) -> dict[str, Any]:
+        return self._response or {}
+
+    def hits(self) -> list[dict[str, Any]]:
+        result = self.response.get('result')
+        return list(result) if isinstance(result, list) else []
+
+    def merge_into(self, pool: list[dict], seen: set[str]) -> int:
+        before = len(pool)
+        _AgentCore.merge_find_product_hits_into_candidate_pool(self.response, pool, seen)
+        return len(pool) - before
+
+class _DialogueNarrationFacade:
+
+    @staticmethod
+    def emit(ctx: 'DialogueRunContext', *, context: dict[str, Any], fallback: str, tool_results: list | None=None, force: bool=False) -> None:
+        rendered = _AgentCore.format_dialogue_step_reasoning_text(ctx.query, context, fallback=fallback, force=force)
+        _AgentCore.append_dialogue_step_with_tool_results(ctx, rendered, tool_results or [])
+
+    @staticmethod
+    def emit_terminal_failure(ctx: 'DialogueRunContext', *, fallback: str, context: dict[str, Any] | None=None) -> None:
+        ctx_payload = dict(context or {})
+        ctx_payload.setdefault('terminal_status', 'failure')
+        _AgentCore.finalize_dialogue_with_product_recommendation(ctx, [NO_MATCH_PRODUCT_ID_SENTINEL], 'failure', think=_AgentCore.format_dialogue_step_reasoning_text(ctx.query, ctx_payload, fallback=fallback, force=True))
+
+class _SpecOrderRoster:
+
+    @staticmethod
+    def rank_for(spec: dict[str, Any]) -> int:
+        return _AgentCore.spec_richness_rank_for_tiebreak(spec)
+
+    @staticmethod
+    def integer_for(spec: dict[str, Any]) -> int | None:
+        return _AgentCore.parse_product_order_rank_integer(spec.get('order'))
+
+    @staticmethod
+    def sorted_indices(specs: list[dict[str, Any]]) -> list[int]:
+        return sorted(range(len(specs)), key=lambda i: (_SpecOrderRoster.rank_for(specs[i]), i))
+
+class _ShoppingDialogueOrchestrator:
+    __slots__ = ('ctx',)
+
+    def __init__(self, ctx: 'DialogueRunContext' | None=None) -> None:
+        self.ctx = ctx if ctx is not None else DialogueRunContext()
+
+    def execute(self, problem_data: dict) -> list[dict]:
+        return _AgentCore.execute_shopping_dialogue_pipeline(self.ctx, problem_data)
+
+    def steps_so_far(self) -> list[dict]:
+        return list(self.ctx.steps)
+
+    def query_text(self) -> str:
+        return self.ctx.query
+
+    def metrics_snapshot(self) -> dict[str, Any]:
+        observer = getattr(self.ctx, 'metrics', None)
+        if isinstance(observer, _DialogueRunMetricsObserver):
+            return observer.as_payload()
+        return {'phase_count': 0, 'aggregate_ms': 0.0, 'phases': []}
+
+class _AgentCore:
+
+    @staticmethod
+    def log_agent_flow(phase: str, message: str, **details: Any) -> None:
+        if details:
+            tail = ' '.join((f'{k}={details[k]!r}' for k in sorted(details)))
+        else:
+            pass
+
+    @staticmethod
+    def clear_thread_local_http_journal() -> None:
+        setattr(thread_local_http_journal_buffer, 'events', [])
+
+    @staticmethod
+    def read_thread_local_http_journal_events() -> list[dict]:
+        event_buf = getattr(thread_local_http_journal_buffer, 'events', None)
+        if isinstance(event_buf, list):
+            return event_buf
+        fresh: list[dict] = []
+        setattr(thread_local_http_journal_buffer, 'events', fresh)
+        return fresh
+
+    @staticmethod
+    def parse_completion_token_usage_from_body(response: Any) -> tuple[int | None, dict | None]:
+        if not isinstance(response, dict):
+            return (None, None)
+        usage_block = response.get('usage')
+        if not isinstance(usage_block, dict):
+            return (None, None)
+        return (usage_block.get('completion_tokens'), usage_block)
+
+    @staticmethod
+    def parse_product_ids_from_catalog_response(path: str, response: Any) -> list[str]:
+        if CATALOG_FIND_PRODUCT_API_PATH not in path or not isinstance(response, list):
+            return []
+        return [str(rec['product_id']) for rec in response if isinstance(rec, dict) and rec.get('product_id')]
+
+    @staticmethod
+    def append_http_roundtrip_journal_event(kind: str, method: str, path: str, elapsed_ms: float, response: Any, params: Any=None, json_data: Any=None) -> None:
+        completion_tokens, usage_block = _AgentCore.parse_completion_token_usage_from_body(response)
+        ts = time.time()
+        event: dict = {'kind': kind, 'method': method, 'path': path, 'duration_ms': round(elapsed_ms, 1), 'completion_tokens': completion_tokens, 'status_code': 200 if isinstance(response, (dict, list)) else None, 'timestamp': int(ts * 1000), 't': ts}
+        if isinstance(params, dict) and params:
+            event['params'] = {k: v for k, v in params.items() if v is not None}
+        if isinstance(json_data, dict) and json_data.get('model'):
+            event['json_data'] = {'model': json_data['model']}
+        if usage_block is not None:
+            event['response'] = {'usage': usage_block}
+        pids = _AgentCore.parse_product_ids_from_catalog_response(path, response)
+        if pids:
+            event['result_product_ids'] = pids
+        _AgentCore.read_thread_local_http_journal_events().append(event)
+
+    @staticmethod
+    def merge_http_journal_into_first_dialogue_step(steps: list[dict]) -> None:
+        if not steps:
+            return
+        trace = [row for row in ({k: ev[k] for k in HTTP_JOURNAL_ROW_FIELD_ORDER if k in ev} for ev in _AgentCore.read_thread_local_http_journal_events()) if row]
+        if not trace:
+            return
+        info = steps[0].get('extra_info')
+        if not isinstance(info, dict):
+            info = {}
+            steps[0]['extra_info'] = info
+        info['proxy_calls'] = trace
+
+    @staticmethod
+    def catalog_http_get_with_rate_limit(path: str, params: dict | None=None):
+        acquire_catalog_http_rate_limit_slot()
+        return journaling_catalog_search_proxy_client.get(path, params)
+
+    @staticmethod
+    def dialogue_budget_seconds_remaining() -> float:
+        if dialogue_run_state.pipeline_start_time <= 0:
+            return DIALOGUE_SESSION_TIMEOUT_SECONDS
+        return DIALOGUE_SESSION_TIMEOUT_SECONDS - (time.monotonic() - dialogue_run_state.pipeline_start_time)
+
+    @staticmethod
+    def invoke_sandbox_tool_with_gap_and_retry(tool_name: str, params: dict) -> dict:
+        elapsed_since_last = time.monotonic() - dialogue_run_state.last_tool_call_timestamp
+        if elapsed_since_last < MIN_SECONDS_BETWEEN_SANDBOX_TOOL_CALLS:
+            time.sleep(MIN_SECONDS_BETWEEN_SANDBOX_TOOL_CALLS - elapsed_since_last)
+        attempt_idx = 0
+        while True:
+            try:
+                call_result = execute_tool_call(tool_name, params)
+                dialogue_run_state.last_tool_call_timestamp = time.monotonic()
+                return call_result
+            except Exception:
+                attempt_idx += 1
+                if attempt_idx >= SANDBOX_TOOL_MAX_RETRY_ATTEMPTS:
+                    raise
+                wait_secs = SANDBOX_TOOL_RETRY_BACKOFF_BASE_SECONDS * 2 ** (attempt_idx - 1)
+                time.sleep(wait_secs)
+
+    @staticmethod
+    def parse_optional_float_from_text(text: str) -> float | None:
+        try:
+            return float(text)
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def normalize_catalog_service_csv_filter(service: str | None) -> str | None:
+        if not service:
+            return service
+        if service == 'default':
+            return None
+        parts = [p.strip() for p in service.split(',') if p.strip() and p.strip() != 'default']
+        return ','.join(parts) or None
+
+    @staticmethod
+    def normalize_voucher_discount_fields(raw: dict | None) -> dict:
+        src = raw or {}
+        out: dict[str, Any] = {'discount_type': src.get('discount_type', 'percentage')}
+        for field in ('discount_value', 'threshold', 'cap', 'budget'):
+            out[field] = float(src.get(field, 0))
+        return out
+
+    @staticmethod
+    def parse_hyphenated_price_range_bounds(price_range: str) -> tuple:
+        if not price_range or not isinstance(price_range, str):
+            return (None, None)
+        left_raw, sep, right_raw = price_range.partition('-')
+        if not sep:
+            return (None, None)
+        left, right = (left_raw.strip(), right_raw.strip())
+        return (_AgentCore.parse_optional_float_from_text(left) if left else None, _AgentCore.parse_optional_float_from_text(right) if right else None)
+
+    @staticmethod
+    def parse_optional_price_range_to_float_bounds(price_range: str | None) -> tuple[float | None, float | None]:
+        if not price_range:
+            return (None, None)
+        s = str(price_range).strip()
+        if '-' not in s:
+            v = _AgentCore.parse_optional_float_from_text(s)
+            return (None, v) if v is not None else (None, None)
+        sep_idx = s.index('-')
+        lo_part, hi_part = (s[:sep_idx].strip(), s[sep_idx + 1:].strip())
+        return (_AgentCore.parse_optional_float_from_text(lo_part) if lo_part else None, _AgentCore.parse_optional_float_from_text(hi_part) if hi_part else None)
+
+    @staticmethod
+    def strip_stopwords_from_search_keywords(text: str | None) -> str:
+        if not text:
+            return FALLBACK_CATALOG_SEARCH_QUERY
+        unique_tokens = list(dict.fromkeys((SEARCH_KEYWORD_SYNONYM_MAP.get(tok, tok) for tok in text.lower().split() if tok not in RELEVANCE_SCORING_STOPWORDS)))
+        return ' '.join(unique_tokens) if unique_tokens else FALLBACK_CATALOG_SEARCH_QUERY
+
+    @staticmethod
+    def normalize_keywords_in_parsed_product(prod: dict) -> dict:
+        cleaned = dict(prod)
+        for field in ('keywords', 'q'):
+            if field in cleaned:
+                cleaned[field] = _AgentCore.strip_stopwords_from_search_keywords(cleaned.get(field))
+        return cleaned
+
+    @staticmethod
+    def normalize_all_products_in_search_params(params: dict) -> dict:
+        out = dict(params)
+        raw_products = out.get('products') or []
+        cleaned_products = [_AgentCore.normalize_keywords_in_parsed_product(p) for p in raw_products if isinstance(p, dict)]
+        if cleaned_products:
+            out['products'] = cleaned_products
+        return out
+
+    @staticmethod
+    def dedupe_listings_by_product_id(products: list) -> list:
+        seen: set[str] = set()
+        result: list = []
+        for entry in products:
+            pid = str(entry.get('product_id', ''))
+            if not pid or pid in seen:
+                continue
+            seen.add(pid)
+            result.append(entry)
+        return result
+
+    @staticmethod
+    def unique_non_empty_product_id_strings(ids: list) -> list[str]:
+        ledger = _ProductIdLedger()
+        ledger.extend(list(ids or []))
+        return ledger.as_list()
+
+    @staticmethod
+    def join_product_ids_as_csv_ordered(ids: list, expected_order: list=None) -> str:
+        deduped = _AgentCore.unique_non_empty_product_id_strings(ids)
+        if expected_order:
+            order_index = {eid: i for i, eid in enumerate(expected_order)}
+            fallback = len(expected_order)
+            deduped.sort(key=lambda eid: order_index.get(eid, fallback))
+        return ','.join(deduped) if deduped else NO_MATCH_PRODUCT_ID_SENTINEL
+
+    @staticmethod
+    def fetch_and_cache_catalog_product_details(product_ids: list[str]) -> dict[str, dict]:
+        if not product_ids:
+            return {}
+        missing = [pid for pid in product_ids if pid not in dialogue_run_state.product_detail_cache]
+        chunk_size = 10
+        idx = 0
+        while idx < len(missing):
+            chunk = missing[idx:idx + chunk_size]
+            idx += chunk_size
+            api_result = _AgentCore.catalog_http_get_with_rate_limit('/search/view_product_information', {'product_ids': ','.join(chunk)})
+            if isinstance(api_result, list):
+                for item in api_result:
+                    dialogue_run_state.product_detail_cache[str(item.get('product_id', ''))] = item
+        return {pid: dialogue_run_state.product_detail_cache[pid] for pid in product_ids if pid in dialogue_run_state.product_detail_cache}
+
+    @staticmethod
+    def normalize_sku_options_to_name_values_list(sku_raw: Any) -> list[dict]:
+        result: list[dict] = []
+        if isinstance(sku_raw, list):
+            for row in sku_raw:
+                if not isinstance(row, dict):
+                    continue
+                vals = row.get('values', [])
+                if not isinstance(vals, list):
+                    vals = list(vals.values()) if isinstance(vals, dict) else []
+                result.append({'name': row.get('name'), 'values': vals[:5]})
+        elif isinstance(sku_raw, dict):
+            attr_map: dict[str, list] = {}
+            for variant in sku_raw.values():
+                if not isinstance(variant, dict):
+                    continue
+                for attr_name, attr_val in variant.items():
+                    bucket = attr_map.setdefault(attr_name, [])
+                    if attr_val not in bucket:
+                        bucket.append(attr_val)
+            for attr_name, values in attr_map.items():
+                result.append({'name': attr_name, 'values': values[:5]})
+        return result
+
+    @staticmethod
+    def attach_cached_details_to_listing_summaries(product_summaries: list[dict]) -> list[dict]:
+        try:
+            _AgentCore.fetch_and_cache_catalog_product_details([str(s.get('product_id', '')) for s in product_summaries])
+        except Exception:
+            pass
+        enriched: list[dict] = []
+        for summary in product_summaries:
+            pid = str(summary.get('product_id', ''))
+            try:
+                detail = dialogue_run_state.product_detail_cache.get(pid) or {}
+                title = summary.get('title') or (detail.get('title', '') if detail else '')
+                price = summary.get('price')
+                if price is None and detail:
+                    price = detail.get('price')
+                entry: dict = {'product_id': pid, 'title': title, 'price': price}
+                if detail:
+                    norm_skus = _AgentCore.normalize_sku_options_to_name_values_list(detail.get('sku_options') or [])
+                    if norm_skus:
+                        entry['sku_options'] = norm_skus[:3]
+                    attrs = detail.get('attributes') or {}
+                    if isinstance(attrs, dict) and attrs:
+                        entry['attributes'] = dict(list(attrs.items())[:8])
+                    svcs = detail.get('service_tags') or detail.get('services') or []
+                    if isinstance(svcs, list) and svcs:
+                        entry['service_tags'] = svcs[:6]
+            except Exception:
+                entry = {'product_id': pid, 'title': summary.get('title', ''), 'price': summary.get('price')}
+            enriched.append(entry)
+        return enriched
+
+    @staticmethod
+    def build_catalog_find_product_api_params(query: str, *, page: int=1, shop_id: str | None=None, price: str | None=None, sort: str | None=None, service: str | None=None) -> dict[str, Any]:
+        p: dict[str, Any] = {'q': quote_plus(query), 'page': page}
+        if shop_id:
+            p['shop_id'] = shop_id
+        if price:
+            p['price'] = price
+        if sort and sort != 'default':
+            p['sort'] = sort
+        svc = _AgentCore.normalize_catalog_service_csv_filter(service)
+        if svc:
+            p['service'] = svc
+        return p
+
+    @staticmethod
+    def execute_catalog_product_search(params: dict[str, Any]) -> list[CatalogListingDict]:
+        return journaling_catalog_search_proxy_client.get('/search/find_product', params) or []
+
+    @staticmethod
+    def spec_keywords_or_query_string(spec: ParsedProductSpecDict) -> str:
+        return spec.get('q') or spec.get('keywords') or FALLBACK_CATALOG_SEARCH_QUERY
+
+    @staticmethod
+    def spec_price_range_for_catalog_api(spec: ParsedProductSpecDict, *, include_price: bool, price_override: str | None=None) -> str | None:
+        if price_override is not None:
+            return price_override
+        return spec.get('price') or spec.get('price_range') if include_price else None
+
+    @staticmethod
+    def search_catalog_for_parsed_spec(spec: ParsedProductSpecDict, *, shop_id: str | None=None, include_price: bool=True, omit_service_from_api: bool=False) -> list[CatalogListingDict]:
+        price_filter = _AgentCore.spec_price_range_for_catalog_api(spec, include_price=include_price)
+        service_filter = None if omit_service_from_api else spec.get('service')
+        q = _AgentCore.spec_keywords_or_query_string(spec)
+        return [row for pg in (1, 2) for row in _AgentCore.execute_catalog_product_search(_AgentCore.build_catalog_find_product_api_params(q, page=pg, shop_id=shop_id, price=price_filter, service=service_filter)) or []]
+
+    @staticmethod
+    def search_spec_within_shop_capped(spec: ParsedProductSpecDict, shop_id: str, *, page: int=1, limit: int=10, omit_service_from_api: bool=False, price_override: str | None=None) -> list[CatalogListingDict]:
+        search_params = _AgentCore.build_catalog_find_product_api_params(_AgentCore.spec_keywords_or_query_string(spec), page=page, shop_id=str(shop_id), price=_AgentCore.spec_price_range_for_catalog_api(spec, include_price=True, price_override=price_override), service=None if omit_service_from_api else spec.get('service'))
+        batch = _AgentCore.execute_catalog_product_search(search_params)
+        deduped = _AgentCore.dedupe_listings_by_product_id(batch or [])
+        return deduped[:limit]
+
+    @staticmethod
+    def parsed_spec_to_find_product_params(product: dict, *, include_price: bool=True) -> dict[str, Any]:
+        kw = product.get('keywords', 'product')
+        svc = product.get('service')
+        q = kw + (' only' if 'only' not in kw and (not svc) and bool(product.get('only_product_type')) else '')
+        p: dict[str, Any] = {'q': q}
+        if include_price and product.get('price_range'):
+            p['price'] = product['price_range']
+        if svc:
+            p['service'] = svc
+        return p
+
+    @staticmethod
+    def product_ids_from_listing_rows(rows: list) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for rec in rows or []:
+            if not isinstance(rec, dict):
+                continue
+            pid = str(rec.get('product_id', '')).strip()
+            if pid and pid not in seen:
+                seen.add(pid)
+                out.append(pid)
+        return out
+
+    @staticmethod
+    def merge_unique_product_id_lists(id_lists: list[list[str]]) -> list[str]:
+        ledger = _ProductIdLedger()
+        idx_group = 0
+        groups = id_lists or []
+        while idx_group < len(groups):
+            grp = groups[idx_group] or []
+            idx_member = 0
+            while idx_member < len(grp):
+                ledger.offer(grp[idx_member])
+                idx_member += 1
+            idx_group += 1
+        return ledger.as_list()
+
+    @staticmethod
+    def collect_product_ids_from_tool_results(find_results: list[dict]) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for resp in find_results or []:
+            for prod in resp.get('result') or []:
+                pid = str(prod.get('product_id', '')).strip()
+                if pid and pid not in seen:
+                    seen.add(pid)
+                    out.append(pid)
+        return out
+
+    @staticmethod
+    def merge_find_product_hits_into_candidate_pool(result: dict, unique: list[dict], seen: set[str]) -> None:
+        for prod in (result or {}).get('result') or []:
+            if (pid := str(prod.get('product_id', ''))) and pid not in seen:
+                seen.add(pid)
+                unique.append(prod)
+
+    @staticmethod
+    def flatten_listing_and_detail_to_search_text(product: dict, detail: dict | None) -> str:
+        fragments = [(product.get('title') or '').lower()]
+        if isinstance(detail, dict):
+            attrs = detail.get('attributes') or {}
+            if isinstance(attrs, dict):
+                for k, vs in attrs.items():
+                    fragments.append(str(k).lower().replace('_', ' '))
+                    if isinstance(vs, list):
+                        fragments.extend((str(v).lower() for v in vs))
+                    else:
+                        fragments.append(str(vs).lower())
+            skus = detail.get('sku_options') or {}
+            if isinstance(skus, dict):
+                for opts in skus.values():
+                    if isinstance(opts, dict):
+                        for k, v in opts.items():
+                            fragments.append(str(k).lower().replace('_', ' '))
+                            fragments.append(str(v).lower())
+        return ' '.join(fragments)
+
+    @staticmethod
+    def compact_listings_for_dialogue_trace(items: list) -> list:
+        return [{'pid': str(item.get('product_id', '')), 'p': item.get('price'), 's': str(item.get('shop_id', ''))} for item in items[:DIALOGUE_TOOL_RESULT_LISTING_CAP] if isinstance(item, dict)]
+
+    @staticmethod
+    def compact_find_product_tool_result_for_trace(tool_call: dict) -> dict:
+        if not isinstance(tool_call, dict) or tool_call.get('name') != 'find_product':
+            return tool_call
+        inner = tool_call.get('result')
+        if isinstance(inner, dict) and isinstance(inner.get('result'), list):
+            return {**tool_call, 'result': {**inner, 'result': _AgentCore.compact_listings_for_dialogue_trace(inner['result'])}}
+        if isinstance(inner, list):
+            return {**tool_call, 'result': _AgentCore.compact_listings_for_dialogue_trace(inner)}
+        return tool_call
+
+    @staticmethod
+    def llm_model_ids_with_role_fallback(model: str) -> list[str]:
+        sandbox = getenv('SANDBOX_MODEL')
+        return [sandbox] if sandbox else [model, INFERENCE_MODEL_REGISTRY['PRODUCT_RANK_MODEL'], INFERENCE_MODEL_REGISTRY['FINAL_FALLBACK_MODEL']]
+
+    @staticmethod
+    def active_llm_model_chain_for_pick() -> list[str]:
+        sandbox = getenv('SANDBOX_MODEL')
+        if sandbox:
+            return [sandbox]
+        return INFERENCE_MODEL_REGISTRY['PICK_CHAIN']
+
+    @staticmethod
+    def active_llm_model_chain_for_batch_score() -> list[str]:
+        sandbox = getenv('SANDBOX_MODEL')
+        if sandbox:
+            return [sandbox]
+        return INFERENCE_MODEL_REGISTRY['SCORE_CHAIN']
+
+    @staticmethod
+    def tokenize_query_for_relevance_scoring(query_text: str) -> list[str]:
+        return list(dict.fromkeys((tok for tok in re.findall('\\b\\w+\\b', query_text.lower()) if len(tok) > 1 and tok not in RELEVANCE_SCORING_STOPWORDS)))
+
+    @staticmethod
+    def query_token_matches_title_word_directly(word: str, title_words: set[str]) -> bool:
+        if word in title_words:
+            return True
+        stem = word[:-1] if word.endswith('s') else f'{word}s'
+        if stem in title_words:
+            return True
+        if len(word) < 3:
+            return False
+        return any((cand.startswith(word) for cand in title_words if len(cand) > len(word)))
+
+    @staticmethod
+    def query_token_partially_matches_title_word(word: str, title_words: set[str]) -> bool:
+        return any((word.startswith(tw) or tw.startswith(word) for tw in title_words if len(tw) > 2))
+
+    @staticmethod
+    def score_title_token_overlap(query_words: list[str], title_words: set[str], title: str) -> float:
+        score = 0.0
+        for w in query_words:
+            if _AgentCore.query_token_matches_title_word_directly(w, title_words):
+                score += 2
+            elif _AgentCore.query_token_partially_matches_title_word(w, title_words):
+                score += 1
+            if any((ch.isdigit() for ch in w)) and w in title:
+                score += 2
+        return score
+
+    @staticmethod
+    def iterate_flat_attribute_pairs_from_detail(detail: CatalogListingDict):
+        for key, vals in (detail.get('attributes') or {}).items():
+            yield (key, vals)
+        for opts in (detail.get('sku_options') or {}).values():
+            if isinstance(opts, dict):
+                yield from opts.items()
+
+    @staticmethod
+    def flatten_detail_to_lowercase_text_and_tokens(detail: CatalogListingDict) -> tuple[str, set[str]]:
+        tokens: list[str] = []
+        exact_vals: set[str] = set()
+        for key, values in (detail.get('attributes') or {}).items():
+            tokens.append(key.replace('_', ' '))
+            for value in values if isinstance(values, list) else [values]:
+                text = str(value).strip().lower()
+                tokens.append(text)
+                exact_vals.add(text)
+        sku_probe = {'attributes': {}, 'sku_options': detail.get('sku_options') or {}}
+        for key, value in _AgentCore.iterate_flat_attribute_pairs_from_detail(sku_probe):
+            text = str(value).strip().lower()
+            tokens.extend((key.replace('_', ' '), text))
+            exact_vals.add(text)
+        return (' '.join(tokens).lower(), exact_vals)
+
+    @staticmethod
+    def score_attribute_text_overlap(query_words: list[str], detail: dict) -> float:
+        detail_text, exact_vals = _AgentCore.flatten_detail_to_lowercase_text_and_tokens(detail)
+        detail_words = set(re.findall('\\b\\w+\\b', detail_text))
+        total = 0.0
+        for w in query_words:
+            if f'{w}#' in exact_vals:
+                total += 5
+            elif w in exact_vals:
+                total += 3
+            elif w in detail_words:
+                total += 2
+        return total
+
+    @staticmethod
+    def score_case_sensitive_attribute_overlap(query_words: list[str], detail: dict) -> float:
+        exact_vals: set[str] = set()
+        attr_words: set[str] = set()
+        for key, vals in (detail.get('attributes') or {}).items():
+            attr_words.update(re.findall('\\b\\w+\\b', key.lower().replace('_', ' ')))
+            for value in vals if isinstance(vals, list) else [vals]:
+                text = str(value).strip().lower()
+                exact_vals.add(text)
+                attr_words.update(re.findall('\\b\\w+\\b', text))
+        for key, value in _AgentCore.iterate_flat_attribute_pairs_from_detail({'attributes': {}, 'sku_options': detail.get('sku_options') or {}}):
+            text = str(value).strip().lower()
+            exact_vals.add(text)
+            attr_words.update(re.findall('\\b\\w+\\b', text))
+            attr_words.update(re.findall('\\b\\w+\\b', key.lower().replace('_', ' ')))
+        score = 0.0
+        for w in query_words:
+            if w in exact_vals or f'{w}#' in exact_vals:
+                score += 5
+            elif w in attr_words:
+                score += 2
+        return score
+
+    @staticmethod
+    def heuristic_listing_relevance_score(product: CatalogListingDict, query_text: str, detail: CatalogListingDict | None=None) -> float:
+        title = product.get('title', '').lower()
+        title_words = set(re.findall('\\b\\w+\\b', title))
+        qw = _AgentCore.tokenize_query_for_relevance_scoring(query_text)
+        score = _AgentCore.score_title_token_overlap(qw, title_words, title)
+        if detail:
+            score += _AgentCore.score_attribute_text_overlap(qw, detail)
+        return score
+
+    @staticmethod
+    def build_parse_regex_hints_from_query(query: str) -> dict[str, Any]:
+        quoted: list[str] = []
+        for m in re.finditer('[\'\\"]([^\'\\"]{2,40})[\'\\"]', query):
+            phrase = m.group(1).strip()
+            if phrase and phrase not in quoted:
+                quoted.append(phrase)
+        number_units: list[str] = []
+        seen_nu: set[str] = set()
+        for m in NUM_UNIT_TOKEN_RE.finditer(query):
+            tok = m.group(0).lower()
+            if tok not in seen_nu:
+                seen_nu.add(tok)
+                number_units.append(tok)
+        size_labels: list[str] = []
+        seen_sz: set[str] = set()
+        for m in PARSE_HINT_SIZE_LABEL_RE.finditer(query):
+            tok = m.group(0).lower()
+            if tok not in seen_sz:
+                seen_sz.add(tok)
+                size_labels.append(tok)
+        color_words: list[str] = []
+        for w in re.findall('\\b[a-zA-Z]+\\b', query.lower()):
+            if w in PARSE_HINT_COLOR_WORDS and w not in color_words:
+                color_words.append(w)
+        svc_csv = _AgentCore.extract_service_tags_csv_from_query(query.lower())
+        service_tags = [s.strip() for s in (svc_csv or '').split(',') if s.strip()]
+        return {'quoted_literals': quoted[:6], 'number_unit_tokens': number_units[:8], 'size_labels': size_labels[:4], 'color_words': color_words[:6], 'service_tags': service_tags[:4]}
+
+    @staticmethod
+    def catalog_attribute_keys_seen_from_detail_cache(max_keys: int=24) -> list[str]:
+        seen: set[str] = set()
+        keys: list[str] = []
+        for detail in dialogue_run_state.product_detail_cache.values():
+            if not isinstance(detail, dict):
+                continue
+            attrs = detail.get('attributes') or {}
+            if isinstance(attrs, dict):
+                for k in attrs:
+                    kl = str(k).strip().lower()
+                    if kl and kl not in seen:
+                        seen.add(kl)
+                        keys.append(kl)
+            elif isinstance(attrs, list):
+                for entry in attrs:
+                    if isinstance(entry, dict):
+                        for k in entry:
+                            kl = str(k).strip().lower()
+                            if kl and kl not in seen:
+                                seen.add(kl)
+                                keys.append(kl)
+            if len(keys) >= max_keys:
+                break
+        return keys[:max_keys]
+
+    @staticmethod
+    def format_llm_parse_user_message(query: str) -> str:
+        payload: dict[str, Any] = {'query': query, 'regex_hints': _QueryHintExtractor(query).as_payload()}
+        attr_keys = _AgentCore.catalog_attribute_keys_seen_from_detail_cache()
+        if attr_keys:
+            payload['catalog_attribute_keys_seen'] = attr_keys
+        return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def listing_service_tags_set(product: dict) -> set[str]:
+        svc = product.get('service')
+        if isinstance(svc, list):
+            return {str(s).strip() for s in svc if str(s).strip()}
+        if isinstance(svc, str) and svc.strip():
+            return {p.strip() for p in svc.split(',') if p.strip()}
+        return set()
+
+    @staticmethod
+    def listing_meets_parsed_spec(product: dict, spec: dict) -> bool:
+        price_range = spec.get('price_range')
+        if price_range and product.get('price') is not None:
+            try:
+                price = float(product.get('price'))
+            except (TypeError, ValueError):
+                return False
+            bounds = _PriceBoundsTuple.from_text(str(price_range))
+            if not bounds.contains(price):
+                return False
+        svc = spec.get('service')
+        if svc:
+            required_raw = frozenset((s.strip() for s in str(svc).split(',') if s.strip()))
+            offered = _ServiceTagSet.from_listing(product)
+            if required_raw and (not required_raw.issubset(offered.tags)):
+                return False
+        return True
+
+    @staticmethod
+    def alternate_query_slug_from_spec(spec: dict, max_words: int=10) -> str | None:
+        text = str(spec.get('query') or '').strip()
+        if not text:
+            return None
+        words = [w for w in re.findall('\\b\\w+\\b', text.lower()) if len(w) > 1 and w not in QUERY_TOKENIZATION_STOPWORDS]
+        if not words:
+            return None
+        slug = ' '.join(words[:max_words])
+        kw = (spec.get('keywords') or '').strip()
+        if not kw:
+            return slug
+        kw_toks = set(re.findall('\\b\\w+\\b', kw.lower()))
+        sl_toks = set(re.findall('\\b\\w+\\b', slug.lower()))
+        if kw_toks and sl_toks and (len(kw_toks & sl_toks) >= min(len(kw_toks), len(sl_toks), 3)):
+            return None
+        return slug
+
+    @staticmethod
+    def extract_spec_hard_constraint_tokens(spec: dict, full_query: str | None=None) -> list[str]:
+        query = spec.get('query', '') or ''
+        keywords = spec.get('keywords', '') or ''
+        combined = f'{query} {keywords}'
+        tokens: list[str] = []
+        for match in re.finditer('[A-Z][A-Za-z0-9]+', query):
+            tok = match.group(0).lower()
+            if tok not in QUERY_TOKENIZATION_STOPWORDS and len(tok) > 2:
+                tokens.append(tok)
+        for match in re.finditer('\\b[a-zA-Z]*\\d[a-zA-Z0-9]*\\b', combined):
+            tok = match.group(0).lower()
+            if tok not in QUERY_TOKENIZATION_STOPWORDS and len(tok) > 1:
+                tokens.append(tok)
+        for match in re.finditer("'([^']+)'", query):
+            for part in re.findall('\\b\\w+\\b', match.group(1).lower()):
+                if part not in QUERY_TOKENIZATION_STOPWORDS and len(part) > 1:
+                    tokens.append(part)
+        seen: set[str] = set()
+        out: list[str] = []
+        for tok in tokens:
+            if tok not in seen:
+                seen.add(tok)
+                out.append(tok)
+        return out
+
+    @staticmethod
+    def count_hard_token_matches_in_listing(product: dict, detail: dict | None, hard_tokens: list[str]) -> int:
+        if not hard_tokens:
+            return 0
+        parts = [str(product.get('title', '') or '').lower()]
+        if detail:
+            text, exact = _AgentCore.flatten_detail_to_lowercase_text_and_tokens(detail)
+            parts.append(text)
+            parts.extend(exact)
+        haystack = ' '.join(parts)
+        haystack_compact = re.sub('[\\s\\-+/]+', '', haystack)
+        return sum((1 for t in hard_tokens if t in haystack or t in haystack_compact))
+
+    @staticmethod
+    def pbpc_rerank_score_for_listing(row: dict, query_text: str, detail: dict | None, spec: dict, hard_tokens: list[str]) -> float:
+        score = _AgentCore.composite_listing_relevance_with_spec_penalties(row, query_text, detail, spec)
+        if hard_tokens:
+            matched = _AgentCore.count_hard_token_matches_in_listing(row, detail, hard_tokens)
+            score += 7.0 * matched
+            if matched == 0:
+                score -= 24.0
+            elif matched < len(hard_tokens):
+                score -= 5.0 * (len(hard_tokens) - matched)
+        if spec.get('only_product_type'):
+            title = str(row.get('title', '') or '').lower()
+            if any((x in title for x in ('case', 'cover', 'holder', 'accessory', 'replacement'))):
+                score -= 3.0
+        try:
+            score -= float(row.get('price', 0) or 0) / 100000.0
+        except (TypeError, ValueError):
+            pass
+        return score
+
+    @staticmethod
+    def pbpc_rank_pool_for_llm_judge(query_text: str, pool: list[dict], spec: dict) -> tuple[list[dict], dict[str, dict], list[str]]:
+        prelim_cap = max(SINGLE_PRODUCT_SHORTLIST_SIZE * 2, 36)
+        prelim = sorted(pool, key=lambda p: _AgentCore.composite_listing_relevance_with_spec_penalties(p, query_text, None, spec), reverse=True)[:prelim_cap]
+        pids = [str(p.get('product_id', '') or '') for p in prelim if p.get('product_id')]
+        details = _AgentCore.fetch_and_cache_catalog_product_details(pids)
+        hard_tokens = _AgentCore.extract_spec_hard_constraint_tokens(spec, full_query=query_text)
+        ranked = sorted(prelim, key=lambda row: _AgentCore.pbpc_rerank_score_for_listing(row, query_text, details.get(str(row.get('product_id', '') or '')), spec, hard_tokens), reverse=True)[:SINGLE_PRODUCT_SHORTLIST_SIZE]
+        return (ranked, details, hard_tokens)
+
+    @staticmethod
+    def pbpc_arbitrate_llm_pick_vs_heuristic(chosen: dict | None, heur_best: dict, details: dict[str, dict], hard_tokens: list[str]) -> dict:
+        if chosen is None:
+            return heur_best
+        try:
+            jscore = float(chosen.get('_llm_relevance_score', 0) or 0.0)
+        except (TypeError, ValueError):
+            jscore = 0.0
+        if hard_tokens:
+            chosen_pid = str(chosen.get('product_id', '') or '')
+            heur_pid = str(heur_best.get('product_id', '') or '')
+            if _AgentCore.count_hard_token_matches_in_listing(chosen, details.get(chosen_pid), hard_tokens) < _AgentCore.count_hard_token_matches_in_listing(heur_best, details.get(heur_pid), hard_tokens):
+                return heur_best
+        if jscore < LLM_JUDGE_LOW_CONFIDENCE_SCORE_THRESHOLD:
+            return heur_best
+        return chosen
+
+    @staticmethod
+    def llm_elect_with_dual_judge_consistency(query_text: str, candidates: list[dict], details: dict[str, dict], spec: dict) -> dict | None:
+        if not candidates:
+            return None
+        first = _AgentCore.llm_elect_best_listing_from_pool(query_text, candidates, details, only_product_type=bool(spec.get('only_product_type', False)))
+        if not first or not SINGLE_PRODUCT_ENABLE_DUAL_JUDGE_CONSISTENCY:
+            return first
+        first_pid = str(first.get('product_id', '') or '').strip()
+        cap = min(len(candidates), SINGLE_PRODUCT_SHORTLIST_SIZE)
+        heur_scores: list[tuple[str, float]] = []
+        for c in candidates[:cap]:
+            pid = str(c.get('product_id', '') or '').strip()
+            heur_scores.append((pid, _AgentCore.composite_listing_relevance_with_spec_penalties(c, query_text, details.get(pid), spec)))
+        heur_scores.sort(key=lambda x: x[1], reverse=True)
+        top_gap = heur_scores[0][1] - heur_scores[1][1] if len(heur_scores) > 1 else 10.0
+        if top_gap >= SINGLE_PRODUCT_DUAL_JUDGE_SCORE_GAP:
+            return first
+        second = _AgentCore.llm_elect_best_listing_from_pool(query_text, list(reversed(candidates[:cap])), details, only_product_type=bool(spec.get('only_product_type', False)))
+        if not second:
+            return first
+        if str(second.get('product_id', '') or '').strip() == first_pid:
+            first['_llm_relevance_score'] = min(10.0, float(first.get('_llm_relevance_score', 0)) + 0.5 * float(second.get('_llm_relevance_score', 0)) / 10.0)
+            return first
+        s1 = float(first.get('_llm_relevance_score', 0))
+        s2 = float(second.get('_llm_relevance_score', 0))
+        return first if s1 >= s2 else second
+
+    @staticmethod
+    def pick_best_listing_with_consistency_judge(query_text: str, pool: list[dict], spec: dict) -> dict | None:
+        if not pool:
+            return None
+        ranked, details, hard_tokens = _AgentCore.pbpc_rank_pool_for_llm_judge(query_text, pool, spec)
+        if not ranked:
+            return None
+        heur_best = max(ranked, key=lambda p: _AgentCore.composite_listing_relevance_with_spec_penalties(p, query_text, details.get(str(p.get('product_id', '') or '')), spec))
+        if _AgentCore.single_product_may_finalize_by_time():
+            chosen = _AgentCore.llm_elect_with_dual_judge_consistency(query_text, ranked, details, spec)
+            if chosen is None:
+                chosen = _AgentCore.llm_final_judge_over_shortlisted_pool(ranked, query_text, top_count=10, parsed_spec=spec)
+        else:
+            chosen = heur_best
+        final = _AgentCore.pbpc_arbitrate_llm_pick_vs_heuristic(chosen, heur_best, details, hard_tokens)
+        if final and (not _AgentCore.listing_meets_parsed_spec(final, spec)) and _AgentCore.listing_meets_parsed_spec(heur_best, spec):
+            return heur_best
+        return final
+
+    @staticmethod
+    def compute_voucher_cart_math(prices: list[float], voucher: dict) -> dict[str, Any]:
+        threshold = float(voucher.get('threshold', 0) or 0)
+        budget = float(voucher.get('budget', 0) or 0)
+        discount_type = voucher.get('discount_type', 'percentage') or 'percentage'
+        discount_value = float(voucher.get('discount_value', 0) or 0)
+        cap = float(voucher.get('cap', 0) or 0)
+        total = float(sum(prices))
+        applied = total >= threshold
+        discount = 0.0
+        if applied:
+            if discount_type == 'fixed':
+                discount = discount_value
+            else:
+                discount = total * (discount_value / 100.0 if discount_value > 1 else discount_value)
+                if cap > 0:
+                    discount = min(discount, cap)
+        total_after = total - discount
+        return {'total': total, 'discount': discount, 'total_after': total_after, 'applied': applied, 'within_budget': total_after <= budget + 1e-09}
+
+    @staticmethod
+    def voucher_utilisation_sort_key(total_after: float, budget: float) -> float:
+        if budget <= 0:
+            return 0.0
+        centre = budget * VOUCHER_UTILISATION_TARGET
+        return 1.0 - abs(total_after - centre) / max(budget, 1.0)
+
+    @staticmethod
+    def listing_numeric_price_or_none(product: CatalogListingDict) -> float | None:
+        try:
+            v = product.get('price')
+            if v is None:
+                return None
+            x = float(v)
+            if x != x or x < 0:
+                return None
+            return x
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def voucher_combo_rank_one_spec_pool(spec_list: list[dict], spec: dict, query: str, k_per_spec: int, score_threshold: float) -> list[tuple[dict, float]]:
+        spec_query = str(spec.get('query') or spec.get('keywords') or query)
+        hard_tokens = _AgentCore.extract_spec_hard_constraint_tokens(spec, full_query=query)
+        working = spec_list
+        if hard_tokens:
+            pids = [str(p.get('product_id', '') or '') for p in spec_list if p.get('product_id')]
+            details = _AgentCore.fetch_and_cache_catalog_product_details(pids)
+            min_required = max(1, (len(hard_tokens) + 1) // 2)
+            filtered = [p for p in spec_list if _AgentCore.count_hard_token_matches_in_listing(p, details.get(str(p.get('product_id', '') or '')), hard_tokens) >= min_required]
+            if filtered:
+                working = filtered
+        if _AgentCore.dialogue_budget_seconds_remaining() > 30:
+            pids = [str(p.get('product_id', '') or '') for p in working[:SINGLE_PRODUCT_BATCH_LLM_SCORE_CAP] if p.get('product_id')]
+            details = _AgentCore.fetch_and_cache_catalog_product_details(pids)
+            scored = _AgentCore.llm_score_listing_batch(spec_query, working[:SINGLE_PRODUCT_BATCH_LLM_SCORE_CAP], details, only_product_type=bool(spec.get('only_product_type', False)))
+            pairs = [(p, sc) for p, sc in scored if _AgentCore.listing_numeric_price_or_none(p) is not None]
+        else:
+            pairs = [(p, _AgentCore.composite_listing_relevance_with_spec_penalties(p, spec_query, None, spec)) for p in working if _AgentCore.listing_numeric_price_or_none(p) is not None]
+        filtered_pairs = [(p, s) for p, s in pairs if s >= score_threshold]
+        if not filtered_pairs:
+            filtered_pairs = sorted(pairs, key=lambda x: x[1], reverse=True)[:k_per_spec]
+        filtered_pairs.sort(key=lambda x: x[1], reverse=True)
+        return filtered_pairs[:k_per_spec]
+
+    @staticmethod
+    def enumerate_voucher_feasible_combos(ranked_per_spec: list[list[tuple[dict, float]]], voucher: dict, max_combos: int) -> list[tuple[float, list[dict], dict]]:
+        feasible: list[tuple[float, list[dict], dict]] = []
+        count = 0
+        budget = float(voucher.get('budget', 0) or 0)
+        for combo in cartesian_product(*ranked_per_spec):
+            count += 1
+            if count > max_combos:
+                break
+            selection = [c[0] for c in combo]
+            pids = [str(p.get('product_id', '') or '') for p in selection]
+            if len(set(pids)) != len(pids):
+                continue
+            prices = [float(p.get('price') or 0) for p in selection]
+            if any((pr <= 0 for pr in prices)):
+                continue
+            calc = _AgentCore.compute_voucher_cart_math(prices, voucher)
+            if not calc['applied'] or not calc['within_budget']:
+                continue
+            rel_sum = sum((c[1] for c in combo))
+            feasible.append((rel_sum, selection, calc))
+        target_after = budget * VOUCHER_UTILISATION_TARGET if budget > 0 else 0.0
+
+        def sort_key(item: tuple[float, list[dict], dict]) -> tuple[float, float, float]:
+            rel, _sel, calc = item
+            util = _AgentCore.voucher_utilisation_sort_key(calc['total_after'], budget)
+            dist = abs(calc['total_after'] - target_after) if target_after > 0 else calc['total_after']
+            return (-rel, -util, dist)
+        feasible.sort(key=sort_key)
+        return feasible
+
+    @staticmethod
+    def build_voucher_combo_feasible_picks(pools: list[list[dict]], products: list[dict], voucher: dict, query: str) -> list[tuple[float, list[dict], dict]]:
+        if not pools or not all(pools):
+            return []
+        ranked = [_AgentCore.voucher_combo_rank_one_spec_pool(pools[i], products[i] if i < len(products) else {}, query, VOUCHER_COMBO_K_PER_SPEC, VOUCHER_COMBO_SCORE_THRESHOLD) for i in range(len(pools))]
+        if not ranked or not all(ranked):
+            return []
+        return _AgentCore.enumerate_voucher_feasible_combos(ranked, voucher, VOUCHER_COMBO_MAX_COMBOS)
+
+    @staticmethod
+    def collect_platform_voucher_spec_pools(products: list[dict], allowed_total: float, max_pages: int=2) -> tuple[list[list[dict]], list]:
+        pools: list[list[dict]] = []
+        tool_calls: list = []
+        price_band = f'1-{allowed_total:.0f}'
+        spec_idx = 0
+        while spec_idx < len(products):
+            spec = products[spec_idx]
+            spec_idx += 1
+            base_payload = _CatalogQueryComposer.from_parsed_spec(spec, include_price=False).with_price_band(price_band).as_dict()
+            merger = _CandidatePoolMerger()
+            page_no = 1
+            while page_no <= max_pages:
+                probe = _ListingProbeRunner({**base_payload, 'page': page_no}).fetch()
+                tool_calls.append(probe.response)
+                merger.merge_payload(probe.response)
+                page_no += 1
+            pools.append(merger.pool)
+        return (pools, tool_calls)
+
+    @staticmethod
+    def try_finalize_platform_voucher_via_combo_grid(ctx: DialogueRunContext, products: list[dict], voucher: dict, allowed_total: float) -> bool:
+        n_specs = len(products)
+        if n_specs < 2 or n_specs > 3:
+            return False
+        pools, scan_calls = _AgentCore.collect_platform_voucher_spec_pools(products, allowed_total)
+        if not all(pools):
+            return False
+        feasible = _AgentCore.build_voucher_combo_feasible_picks(pools, products, voucher, ctx.query)
+        if not feasible:
+            return False
+        _rel, selection, calc = feasible[0]
+        pids = [str(p.get('product_id', '') or '').strip() for p in selection]
+        if not all(pids):
+            return False
+        think = _AgentCore.format_dialogue_step_reasoning_text(ctx.query, {'method': 'voucher_combo_grid', 'n_specs': n_specs, 'total_before': round(calc['total'], 2), 'total_after': round(calc['total_after'], 2), 'allowed_total': round(allowed_total, 2), 'product_ids': pids}, fallback=f"Combinatorial voucher pick ({n_specs} specs): searched per-spec pools under allowed_total={allowed_total:.2f}, ranked with hard-token + LLM scores, enumerated feasible carts (threshold/discount/budget), and chose the best relevance sum with utilisation tie-break (~{VOUCHER_UTILISATION_TARGET:.0%} of budget). Pre-discount total={calc['total']:.2f}, after discount={calc['total_after']:.2f}. Recommending {pids}.")
+        _AgentCore.append_dialogue_step_with_tool_results(ctx, think, scan_calls)
+        _AgentCore.finalize_dialogue_with_product_recommendation(ctx, pids, 'success', think=think)
+        return True
+
+    @staticmethod
+    def composite_listing_relevance_with_spec_penalties(product: dict, query_text: str, detail: dict=None, parsed_spec: dict=None) -> float:
+        title = product.get('title', '').lower()
+        title_words = set(re.findall('\\b\\w+\\b', title))
+        qw = _AgentCore.tokenize_query_for_relevance_scoring(query_text)
+        spec = parsed_spec or {}
+        score = _AgentCore.score_title_token_overlap(qw, title_words, title)
+        price_val = product.get('price')
+        price_range_str = spec.get('price_range')
+        if isinstance(price_val, (int, float)) and price_range_str:
+            lo, hi = _AgentCore.parse_hyphenated_price_range_bounds(price_range_str)
+            outside = lo is not None and price_val < lo or (hi is not None and price_val > hi)
+            score += -25 if outside else 5
+        prod_svcs = set(product.get('service') or [])
+        required_svc = spec.get('service')
+        if required_svc:
+            for svc in (s.strip() for s in required_svc.split(',') if s.strip()):
+                score += 5 if svc in prod_svcs else -15
+        elif prod_svcs:
+            score -= 4 * sum((1 for svc in prod_svcs if svc not in {'COD', 'official'}))
+        if detail:
+            score += _AgentCore.score_case_sensitive_attribute_overlap(qw, detail)
+        return score
+
+    @staticmethod
+    def safe_rounded_heuristic_score_or_none(prod: dict, q: str, spec: dict | None) -> float | None:
+        try:
+            return round(_AgentCore.composite_listing_relevance_with_spec_penalties(prod, q, parsed_spec=spec), 1)
+        except Exception:
+            return None
+
+    @staticmethod
+    def coerce_value_to_optional_float(v: Any) -> float | None:
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def parse_json_object_from_llm_content(content: str) -> dict | None:
+        cleaned = re.sub('<think(?:ing)?>.*?</think(?:ing)?>', '', content, flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub('<reasoning>.*?</reasoning>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub('```json?\\s*|```\\s*', '', cleaned).strip()
+        try:
+            out = json.loads(cleaned)
+            if isinstance(out, dict):
+                return out
+        except json.JSONDecodeError:
+            pass
+        start = cleaned.find('{')
+        if start != -1:
+            depth = 0
+            in_str = False
+            escape_next = False
+            for i, ch in enumerate(cleaned[start:], start):
+                if escape_next:
+                    escape_next = False
+                    continue
+                if ch == '\\' and in_str:
+                    escape_next = True
+                    continue
+                if ch == '"':
+                    in_str = not in_str
+                    continue
+                if in_str:
+                    continue
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        candidate = cleaned[start:i + 1]
+                        try:
+                            out = json.loads(candidate)
+                            if isinstance(out, dict):
+                                return out
+                        except json.JSONDecodeError:
+                            break
+        brace_match = re.search('\\{.*\\}', content, re.DOTALL)
+        if brace_match:
+            try:
+                out = json.loads(brace_match.group())
+                if isinstance(out, dict):
+                    return out
+            except json.JSONDecodeError:
+                pass
+        return None
+
+    @staticmethod
+    def truncate_strings_in_nested_json(value: Any, max_len: int) -> Any:
+        if isinstance(value, str):
+            return value[:max_len] if len(value) > max_len else value
+        if isinstance(value, list):
+            return [_AgentCore.truncate_strings_in_nested_json(v, max_len) for v in value]
+        if isinstance(value, dict):
+            return {k: _AgentCore.truncate_strings_in_nested_json(v, max_len) for k, v in value.items()}
+        return value
+
+    @staticmethod
+    def build_llm_batch_score_candidate_dict(product: dict, detail: dict | None, query_text: str) -> dict:
+        det = detail or {}
+        sku_options = det.get('sku_options') or {}
+        query_words = {w for w in re.findall('\\b\\w+\\b', query_text.lower()) if len(w) > 1 and w not in RELEVANCE_SCORING_STOPWORDS}
+        ranked_opts: list[tuple[int, dict]] = []
+        for opt in sku_options.values():
+            if isinstance(opt, dict):
+                opt_words = {w for w in re.findall('\\b\\w+\\b', ' '.join((str(v).lower() for v in opt.values()))) if len(w) > 1}
+                ranked_opts.append((len(query_words & opt_words), opt))
+        seen_keys: set[str] = set()
+        sku_preview: list[dict] = []
+        for _, opt in sorted(ranked_opts, key=lambda t: t[0], reverse=True):
+            key = json.dumps(opt, sort_keys=True, ensure_ascii=False)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                sku_preview.append(opt)
+        raw_attrs = det.get('attributes') or {}
+        bounded_attrs: dict = {}
+        if isinstance(raw_attrs, dict):
+            for k, v in list(raw_attrs.items())[:8]:
+                bounded_attrs[str(k)[:40]] = _AgentCore.truncate_strings_in_nested_json(v, 80)
+        raw_title = str(product.get('title', ''))
+        title = raw_title[:200] if len(raw_title) > 200 else raw_title
+        return {'product_id': str(product.get('product_id', '')).strip(), 'title': title, 'price': product.get('price'), 'service': product.get('service', []), 'attributes': bounded_attrs, 'sku_options_preview': [_AgentCore.truncate_strings_in_nested_json(o, 80) for o in sku_preview[:8]]}
+
+    @staticmethod
+    def llm_score_listing_batch(query_text: str, candidates: list[CatalogListingDict], details: dict[str, dict], only_product_type: bool=False, model: str=INFERENCE_MODEL_REGISTRY['BACKUP_LLM_MODEL']) -> list[tuple[CatalogListingDict, float]]:
+        if not candidates:
+            return []
+        if _AgentCore.dialogue_budget_seconds_remaining() < 35.0:
+            return [(p, 7.0) for p in candidates if _AgentCore.heuristic_listing_relevance_score(p, query_text) > 0]
+        payload = {'request': query_text, 'candidates': [_AgentCore.build_llm_batch_score_candidate_dict(p, details.get(str(p.get('product_id', ''))), query_text) for p in candidates], 'only_product_type': only_product_type}
+        user_content = json.dumps(payload, ensure_ascii=False)
+        for m in _ModelChainRoster.for_role('batch_score'):
+            attempt = 0
+            while attempt < LLM_COMPLETION_MAX_ATTEMPTS_PER_MODEL:
+                attempt += 1
+                llm_resp = journaling_llm_inference_proxy_client.post('/inference/chat/completions', json_data={'model': m, 'temperature': 0.5, 'stream': False, 'messages': [{'role': 'system', 'content': LLM_PROMPT_SCORE_CANDIDATE_BATCH}, {'role': 'user', 'content': user_content}]})
+                if not (llm_resp and llm_resp.get('choices')):
+                    continue
+                raw_content = llm_resp['choices'][0].get('message', {}).get('content', '')
+                stripped = re.sub('```json?\\s*', '', raw_content)
+                stripped = re.sub('```\\s*$', '', stripped).strip()
+                score_list = None
+                try:
+                    score_list = json.loads(stripped)
+                except json.JSONDecodeError:
+                    array_match = re.search('\\[.*\\]', raw_content, re.DOTALL)
+                    if array_match:
+                        try:
+                            score_list = json.loads(array_match.group())
+                        except json.JSONDecodeError:
+                            pass
+                if not isinstance(score_list, list):
+                    continue
+                pid_to_score: dict[str, float] = {}
+                for entry in score_list:
+                    if not isinstance(entry, dict):
+                        continue
+                    pid = str(entry.get('product_id', '')).strip()
+                    if not pid:
+                        continue
+                    try:
+                        pid_to_score[pid] = float(entry.get('score', 0))
+                    except (TypeError, ValueError):
+                        pid_to_score[pid] = 0.0
+                scored = [(p, pid_to_score.get(str(p.get('product_id', '')).strip(), 0.0)) for p in candidates]
+                scored.sort(key=lambda x: (x[1], str(x[0].get('product_id', ''))), reverse=True)
+                return scored
+        scored = [(p, 7.0 if _AgentCore.heuristic_listing_relevance_score(p, query_text) > 0 else 0.0) for p in candidates]
+        scored.sort(key=lambda x: (x[1], str(x[0].get('product_id', ''))), reverse=True)
+        return scored
+
+    @staticmethod
+    def llm_elect_best_listing_from_pool(query_text: str, candidates: list, details: dict[str, dict], only_product_type: bool=False, model: str=INFERENCE_MODEL_REGISTRY['FINAL_FALLBACK_MODEL'], *, max_candidates: int=10) -> dict | None:
+        if _AgentCore.dialogue_budget_seconds_remaining() < 35.0:
+            return None
+        cap = max(1, min(int(max_candidates), 60))
+        slice_c = candidates[:cap]
+        payload = {'request': query_text, 'candidates': [_AgentCore.build_llm_batch_score_candidate_dict(p, details.get(str(p.get('product_id', ''))), query_text) for p in slice_c], 'only_product_type': only_product_type}
+        user_content = json.dumps(payload, ensure_ascii=False)
+        for m in _ModelChainRoster.for_role('pick'):
+            for attempt in range(1, LLM_COMPLETION_MAX_ATTEMPTS_PER_MODEL + 1):
+                result = journaling_llm_inference_proxy_client.post('/inference/chat/completions', json_data={'model': m, 'temperature': 0.5, 'stream': False, 'messages': [{'role': 'system', 'content': LLM_PROMPT_JUDGE_BEST_LISTING}, {'role': 'user', 'content': user_content}]})
+                if not (result and result.get('choices')):
+                    continue
+                content = result['choices'][0].get('message', {}).get('content', '')
+                parsed = _AgentCore.parse_json_object_from_llm_content(content)
+                if not isinstance(parsed, dict):
+                    continue
+                best_pid = str(parsed.get('best_product_id', '') or '').strip()
+                reason = str(parsed.get('reason', '')).strip()
+                try:
+                    rel_score = float(parsed.get('relevance_score', 0))
+                except (TypeError, ValueError):
+                    rel_score = 0.0
+                _null_pids = {'', 'none', 'null', '0', 'undefined', 'n/a'}
+                if best_pid.lower() in _null_pids:
+                    continue
+                for p in slice_c:
+                    if str(p.get('product_id', '')).strip() == best_pid:
+                        chosen = dict(p)
+                        det = details.get(str(p.get('product_id', '')))
+                        _AgentCore.attach_grounded_llm_reason_to_listing(chosen, reason, rel_score, p, det, query_text)
+                        return chosen
+        if slice_c:
+            if not any(('_llm_relevance_score' in p for p in slice_c)):
+                try:
+                    score_by_pid = {str(sp.get('product_id', '')): float(sc or 0.0) for sp, sc in _AgentCore.llm_score_listing_batch(query_text, slice_c, details, only_product_type)}
+                    for p in slice_c:
+                        pid_key = str(p.get('product_id', ''))
+                        if pid_key in score_by_pid:
+                            p['_llm_relevance_score'] = score_by_pid[pid_key]
+                except Exception:
+                    pass
+            fallback = max(slice_c, key=lambda p: (float(p.get('_llm_relevance_score', 0.0) or 0.0), _AgentCore.heuristic_listing_relevance_score(p, query_text)))
+            fallback = dict(fallback)
+            fallback.setdefault('_llm_relevance_score', 0.0)
+            fallback.setdefault('_llm_reason', 'heuristic fallback ? LLM did not return a valid product_id')
+            return fallback
+        return None
+
+    @staticmethod
+    def format_dialogue_step_reasoning_text(query: str, context: dict, fallback: str, force: bool=False) -> str:
+        _ = (query, context, force)
+        return fallback
+
+    @staticmethod
+    def find_ungrounded_terms_in_llm_reason(reason: str, product: dict, detail: dict | None, query_text: str) -> tuple[bool, list[str]]:
+        haystack = _AgentCore.flatten_listing_and_detail_to_search_text(product, detail)
+        query_terms = {w for w in re.findall('\\b\\w{4,}\\b', (query_text or '').lower()) if w not in RELEVANCE_SCORING_STOPWORDS}
+        if not query_terms:
+            return (True, [])
+        reason_lower = (reason or '').lower()
+        claimed = {t for t in query_terms if t in reason_lower}
+        missing = [t for t in claimed if t not in haystack]
+        return (len(missing) == 0, missing)
+
+    @staticmethod
+    def rewrite_reason_for_ungrounded_terms(original_reason: str, missing: list[str]) -> str:
+        ms = ', '.join(sorted(missing))
+        return f'Selected as the best available match among returned candidates; the user\'s requested term(s) ({ms}) could not be confirmed literally in this product\'s title, attributes, or sku_options, so the match is partial.'
+
+    @staticmethod
+    def attach_grounded_llm_reason_to_listing(result_product: dict, reason: str, relevance_score: float, product: dict, detail: dict | None, query_text: str) -> None:
+        grounded, missing = _AgentCore.find_ungrounded_terms_in_llm_reason(reason, product, detail, query_text)
+        result_product['_llm_relevance_score'] = relevance_score
+        if grounded:
+            result_product['_llm_reason'] = reason
+            return
+        result_product['_llm_reason'] = _AgentCore.rewrite_reason_for_ungrounded_terms(reason, missing)
+        result_product['_llm_reason_ungrounded_terms'] = missing
+
+    @staticmethod
+    def llm_choose_best_shop_for_specs(shop_ids: list[str], shop_coverage: dict[str, dict[int, list[CatalogListingDict]]], specs: list[ParsedProductSpecDict], query: str) -> tuple[str | None, dict[int, dict]]:
+
+        def choose_for_shop_spec(shop_id: str, sidx: int, spec: ParsedProductSpecDict) -> tuple[float, dict] | None:
+            products = list((shop_coverage.get(shop_id) or {}).get(sidx) or [])
+            if not products:
+                return None
+            search_q = spec.get('query') or spec.get('keywords') or query
+            pids = [str(p.get('product_id', '')) for p in products if p.get('product_id')]
+            details = _AgentCore.fetch_and_cache_catalog_product_details(pids)
+            chosen = _AgentCore.llm_elect_best_listing_from_pool(search_q, products, details, only_product_type=bool(spec.get('only_product_type', False)), model=INFERENCE_MODEL_REGISTRY['BACKUP_LLM_MODEL'])
+            if chosen:
+                sc = float(chosen.get('_llm_relevance_score', 0))
+                return (sc, {'product_id': str(chosen.get('product_id', '')), 'reason': chosen.get('_llm_reason', ''), 'score': sc})
+            return (0.0, {'product_id': str(products[0].get('product_id', '')), 'reason': '', 'score': 0.0})
+        best_shop: str | None = None
+        best_total: float = -1.0
+        best_chosen: dict[int, dict] = {}
+        for shop_id in shop_ids:
+            total_score = 0.0
+            chosen_for_shop: dict[int, dict] = {}
+            for sidx, spec in enumerate(specs):
+                picked = choose_for_shop_spec(shop_id, sidx, spec)
+                if picked is None:
+                    continue
+                sc, payload = picked
+                total_score += sc
+                chosen_for_shop[sidx] = payload
+            if total_score > best_total:
+                best_total = total_score
+                best_shop = shop_id
+                best_chosen = chosen_for_shop
+        return (best_shop, best_chosen)
+
+    @staticmethod
+    def llm_parse_full_shopping_parameters(query: str, task_type: str) -> dict:
+        sys_prompt = LLM_PARSE_PROMPT_BY_TASK_KIND.get(task_type, LLM_PROMPT_PARSE_SINGLE_PRODUCT)
+        base_model = LLM_PARSE_MODEL_BY_TASK_KIND.get(task_type, INFERENCE_MODEL_REGISTRY['VOUCHER_PARSE_MODEL'])
+        user_message = _AgentCore.format_llm_parse_user_message(query)
+        for model in _AgentCore.llm_model_ids_with_role_fallback(base_model):
+            result = journaling_llm_inference_proxy_client.post('/inference/chat/completions', json_data={'model': model, 'temperature': 0, 'stream': False, 'messages': [{'role': 'system', 'content': sys_prompt}, {'role': 'user', 'content': user_message}]})
+            parsed = _AgentCore.parse_llm_parameter_json_or_none(result, task_type)
+            if parsed is not None:
+                return parsed
+            msg = 'returned unparseable response' if result and result.get('choices') else 'returned no response'
+        return _AgentCore.build_regex_fallback_parameter_snapshot(query)
+
+    @staticmethod
+    def parse_llm_parameter_json_or_none(result: dict, task_type: str) -> dict | None:
+        if not result or not result.get('choices'):
+            return None
+        content = result['choices'][0].get('message', {}).get('content', '')
+        parsed = _AgentCore.parse_json_object_from_llm_content(content)
+        if parsed is None:
+            return None
+        if task_type == 'product':
+            return _AgentCore.normalize_all_products_in_search_params(parsed)
+        if task_type == 'shop':
+            return _AgentCore.normalize_keywords_for_shop_mode_parse(parsed)
+        return parsed
+
+    @staticmethod
+    def audit_selected_listing_against_spec(*, title: str, price: Any, parsed_spec: dict) -> dict:
+        title_lower = (title or '').lower()
+        spec = parsed_spec or {}
+        kw = [w for w in str(spec.get('keywords', '') or '').lower().split() if w]
+        matched = [w for w in kw if w in title_lower]
+        missing = [w for w in kw if w not in title_lower]
+        price_ok: bool | None = None
+        price_note = 'no price range was parsed from the query'
+        price_range = spec.get('price_range')
+        if price_range:
+            try:
+                lo, hi = _AgentCore.parse_hyphenated_price_range_bounds(str(price_range))
+                if price is None:
+                    price_note = f'no price available to compare against range {price_range}'
+                else:
+                    pv = float(price)
+                    if lo is not None and pv < lo:
+                        price_ok, price_note = (False, f'price {pv} is BELOW lower bound {lo} of range {price_range}')
+                    elif hi is not None and pv > hi:
+                        price_ok, price_note = (False, f'price {pv} is ABOVE upper bound {hi} of range {price_range}')
+                    else:
+                        price_ok, price_note = (True, f'price {pv} fits inside range {price_range}')
+            except (TypeError, ValueError):
+                price_note = f'price {price!r} is not numeric; could not check range {price_range}'
+        has_missing = bool(missing)
+        price_bad = price_ok is False
+        if not has_missing and (not price_bad):
+            note = 'The selected product looks like a genuine match for the parsed query.'
+        elif has_missing and price_bad:
+            note = f'HONEST MISMATCH: title is missing query terms {missing} and price is outside the requested range. This is the best available candidate, not a clean fit.'
+        elif has_missing:
+            note = f'HONEST MISMATCH: the selected title is missing query terms {missing}; attributes may still confirm the fit, but the title alone is imperfect.'
+        else:
+            note = 'HONEST MISMATCH: title matches the keywords but the price does not fit the requested range. Taking it as the closest available option.'
+        return {'query_keywords': kw, 'keywords_matched': matched, 'keywords_missing': missing, 'title_contains_all_keywords': not has_missing, 'price_ok': price_ok, 'price_note': price_note, 'overall_note': note}
+
+    @staticmethod
+    def build_leader_vs_alternate_reason(leader: dict, alt: dict, query: str='', spec: dict | None=None) -> str:
+        spec = spec or {}
+        parts: list[str] = []
+        lead_llm = _AgentCore.coerce_value_to_optional_float(leader.get('_llm_relevance_score'))
+        alt_llm = _AgentCore.coerce_value_to_optional_float(alt.get('_llm_relevance_score'))
+        if lead_llm is not None and alt_llm is not None and (abs(lead_llm - alt_llm) > 0.01):
+            parts.append(f'its judge relevance score {lead_llm:.1f} beats the alternative\'s {alt_llm:.1f}')
+        else:
+            lead_h = _AgentCore.coerce_value_to_optional_float(leader.get('heuristic_score'))
+            alt_h = _AgentCore.coerce_value_to_optional_float(alt.get('heuristic_score'))
+            if lead_h is None or alt_h is None:
+                try:
+                    lead_h = round(_AgentCore.heuristic_listing_relevance_score(leader, query), 1)
+                    alt_h = round(_AgentCore.heuristic_listing_relevance_score(alt, query), 1)
+                except Exception:
+                    lead_h = alt_h = None
+            if lead_h is not None and alt_h is not None and (abs(lead_h - alt_h) > 0.01):
+                parts.append(f'its title-keyword overlap score {lead_h:.1f} is higher than the alternative\'s {alt_h:.1f}')
+        keywords_str = str(spec.get('keywords') or query)
+        qtoks = {w for w in re.findall('\\b\\w+\\b', keywords_str.lower()) if len(w) > 1 and w not in RELEVANCE_SCORING_STOPWORDS}
+        if qtoks:
+            lead_words = set(re.findall('\\b\\w+\\b', str(leader.get('title', '')).lower()))
+            alt_words = set(re.findall('\\b\\w+\\b', str(alt.get('title', '')).lower()))
+            lead_only = sorted(qtoks & lead_words - alt_words)
+            if lead_only:
+                parts.append(f'its title carries query term(s) {lead_only} that the alternative\'s title omits')
+        pr_raw = spec.get('price_range')
+        if pr_raw:
+            lo, hi = _AgentCore.parse_optional_price_range_to_float_bounds(str(pr_raw))
+            lp = _AgentCore.coerce_value_to_optional_float(leader.get('price'))
+            ap = _AgentCore.coerce_value_to_optional_float(alt.get('price'))
+            if lp is not None and ap is not None:
+                if hi is not None and ap > hi and (lp <= hi):
+                    parts.append(f'the alternative\'s price {ap:.0f} exceeds the requested ceiling {hi:.0f} while the leader\'s {lp:.0f} fits inside the range')
+                elif lo is not None and lp >= lo and (ap < lo):
+                    parts.append(f'the alternative\'s price {ap:.0f} is below the requested floor {lo:.0f} while the leader\'s {lp:.0f} meets the minimum')
+        if not parts:
+            lp = _AgentCore.coerce_value_to_optional_float(leader.get('price'))
+            ap = _AgentCore.coerce_value_to_optional_float(alt.get('price'))
+            if lp is not None and ap is not None and (abs(lp - ap) > 0.01):
+                parts.append(f'its price {lp:.2f} differs from the alternative\'s {ap:.2f} and the heuristic ranking placed it above the alternative on this candidate pool')
+            else:
+                parts.append("the heuristic ranking placed it above the alternative on this candidate pool's title-token coverage of the spec keywords")
+        return '; '.join(parts)
+
+    @staticmethod
+    def format_single_product_comparison_clause(leader: dict, alternatives: list, query: str='', spec: dict | None=None) -> str:
+        if not leader or not alternatives:
+            return ''
+        alt = alternatives[0]
+        reason = _AgentCore.build_leader_vs_alternate_reason(leader, alt, query, spec)
+        return f" I prefer pid={leader.get('product_id', '')} (price={leader.get('price')}) OVER pid={alt.get('product_id', '')} (price={alt.get('price')}) because {reason}."
+
+    @staticmethod
+    def format_alternate_listing_for_narration(a: dict, query: str, spec: dict | None, *, with_title: bool=True) -> dict:
+        entry: dict = {'product_id': str(a.get('product_id', '') or ''), 'price': a.get('price'), 'heuristic_score': _AgentCore.safe_rounded_heuristic_score_or_none(a, query, spec)}
+        if with_title:
+            entry['title'] = (a.get('title') or '')[:80]
+        llm_sc = a.get('_llm_relevance_score')
+        if llm_sc is not None:
+            entry['_llm_relevance_score'] = llm_sc
+        return entry
+
+    @staticmethod
+    def top_alternate_listings_for_narration(leader: dict | None, pool: list, spec: dict | None, query: str, n: int=2, *, with_title: bool=True) -> list[dict]:
+        if not leader or not pool:
+            return []
+        lead_pid = str(leader.get('product_id', '') or '')
+        others = [p for p in pool if str(p.get('product_id', '') or '') != lead_pid]
+        try:
+            others.sort(key=lambda p: _AgentCore.heuristic_listing_relevance_score(p, query), reverse=True)
+        except Exception:
+            pass
+        return [_AgentCore.format_alternate_listing_for_narration(a, query, spec, with_title=with_title) for a in others[:n]]
+
+    @staticmethod
+    def out_of_pool_comparison_alt(leader: dict | None, spec: dict | None, query: str, seen_ids: set) -> dict | None:
+        lead_pid = str((leader or {}).get('product_id', '') or '')
+        cache = dialogue_run_state.out_of_pool_alt_cache
+        cache_key = (lead_pid, str((spec or {}).get('keywords') or ''))
+        if cache_key in cache:
+            return cache[cache_key]
+        alt_entry: dict | None = None
+        try:
+            params = {**_AgentCore.parsed_spec_to_find_product_params(spec or {}), 'page': 5}
+            res = _AgentCore.invoke_sandbox_tool_with_gap_and_retry('find_product', params)
+            rows = (res or {}).get('result') or []
+            seen = seen_ids or set()
+            fresh = [r for r in rows if (pid := str(r.get('product_id', '') or '')) and pid not in seen and (pid != lead_pid)]
+            if fresh:
+                row = random.choice(fresh)
+                alt_entry = {'product_id': str(row.get('product_id', '') or ''), 'title': (row.get('title') or '')[:80], 'price': row.get('price'), 'heuristic_score': _AgentCore.safe_rounded_heuristic_score_or_none(row, query, spec)}
+        except Exception:
+            alt_entry = None
+        cache[cache_key] = alt_entry
+        return alt_entry
+
+    @staticmethod
+    def spec_richness_rank_for_tiebreak(spec: ParsedProductSpecDict) -> int:
+        rank = _AgentCore.parse_product_order_rank_integer(spec.get('order'))
+        return SPEC_RICHNESS_RANK_WORST_SENTINEL if rank is None else rank
+
+    @staticmethod
+    def parse_product_order_rank_integer(value: object) -> int | None:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            n = int(value)
+            return n if n >= 1 else None
+        text = str(value).strip().lower()
+        if not text:
+            return None
+        m = re.match('^(\\d+)', text)
+        return int(m.group(1)) if m else None
+
+    @staticmethod
+    def normalize_keywords_for_shop_mode_parse(parsed: dict) -> dict:
+        for prod in parsed.get('products', []):
+            kw = prod.get('keywords')
+            if not kw:
+                continue
+            if isinstance(kw, list):
+                kw = ' '.join((str(t) for t in kw))
+            prod['keywords'] = ' '.join((w for w in str(kw).split() if w.lower() not in RELEVANCE_SCORING_STOPWORDS))
+        return parsed
+
+    @staticmethod
+    def build_seller_vocabulary_hyde_probe_query(spec: dict) -> str | None:
+        title = str(spec.get('hypothetical_title') or '').strip()
+        if not title:
+            return None
+        uniq = list(dict.fromkeys((w for w in re.findall('\\b\\w+\\b', title.lower()) if w not in QUERY_TOKENIZATION_STOPWORDS and w not in RELEVANCE_SCORING_STOPWORDS and (len(w) > 1) and (not w.isdigit()))))
+        return ' '.join(uniq[:10]) if len(uniq) >= 3 else None
+
+    @staticmethod
+    def weighted_constraint_coverage_score(product: dict, detail: dict | None, constraints: dict) -> float:
+        if not constraints:
+            return 1.0
+        haystack: set[str] = set()
+        title = str(product.get('title', '')).lower()
+        haystack.update(re.findall('\\b\\w+\\b', title))
+        if isinstance(detail, dict):
+            for _k, vs in (detail.get('attributes') or {}).items():
+                for v in vs if isinstance(vs, list) else [vs]:
+                    haystack.update(re.findall('\\b\\w+\\b', str(v).lower()))
+            for _sid, opts in (detail.get('sku_options') or {}).items():
+                if isinstance(opts, dict):
+                    for _k, v in opts.items():
+                        haystack.update(re.findall('\\b\\w+\\b', str(v).lower()))
+        matched = 0
+        for _k, v in constraints.items():
+            value_tokens = re.findall('\\b\\w+\\b', str(v).lower())
+            if not value_tokens:
+                continue
+            if all((t in haystack for t in value_tokens)):
+                matched += 1
+        return matched / max(len(constraints), 1)
+
+    @staticmethod
+    def single_product_flow_elapsed_seconds() -> float:
+        if dialogue_run_state.pipeline_start_time <= 0:
+            return 0.0
+        return time.monotonic() - dialogue_run_state.pipeline_start_time
+
+    @staticmethod
+    def single_product_may_run_probe_by_time() -> bool:
+        return _AgentCore.single_product_flow_elapsed_seconds() < SINGLE_PRODUCT_PROBE_MAX_ELAPSED_SECONDS
+
+    @staticmethod
+    def single_product_may_finalize_by_time() -> bool:
+        return _AgentCore.single_product_flow_elapsed_seconds() < SINGLE_PRODUCT_FINALIZE_MAX_ELAPSED_SECONDS
+
+    @staticmethod
+    def llm_final_judge_over_shortlisted_pool(products: list[dict], query_text: str, *, top_count: int=10, parsed_spec: dict | None=None) -> dict | None:
+        if not products:
+            return None
+        spec = parsed_spec or {}
+        ranked, details, _hard = _AgentCore.pbpc_rank_pool_for_llm_judge(query_text, products, spec)
+        top = ranked[:top_count]
+        if not top:
+            return None
+        llm = _AgentCore.llm_elect_best_listing_from_pool(query_text, top, details, only_product_type=bool(spec.get('only_product_type', False)))
+        if llm is not None:
+            return llm
+        return max(top, key=lambda p: _AgentCore.composite_listing_relevance_with_spec_penalties(p, query_text, details.get(str(p.get('product_id', '') or '')), spec))
+
+    @staticmethod
+    def llm_judge_best_from_candidate_pool(query_text: str, pool: list[dict], spec: dict) -> dict | None:
+        return _AgentCore.pick_best_listing_with_consistency_judge(query_text, pool, spec)
+
+    @staticmethod
+    def build_task_intro_narration_fallback(task_type: str, ctx: 'DialogueRunContext', keyword_list: list, price_list: list, service_list: list) -> str:
+        base = f'Task type: {task_type}. Query (prefix): \'{ctx.query[:300]}\'. Parsed search keywords per product line: {keyword_list}. Parsed price_range strings: {price_list}. Parsed service filters: {service_list}. '
+        if task_type == 'shop':
+            return base + ' Next: same-shop flow runs per-spec catalog retrieval, `llm_score_listing_batch` thresholding, full-coverage shop detection, then Case C / anchor logic if needed.'
+        if task_type == 'voucher':
+            return base + ' Next: voucher flow computes `allowed_total` from discount/threshold/cap/budget, then searches price bands, scores candidates, and enforces cart window [threshold, allowed_total].'
+        if task_type == 'product':
+            return base + ' Next: single-product flow searches, judges, and may broaden before recommending.'
+        return base
+
+    @staticmethod
+    def run_fast_accept_verification_probes(ctx, spec: dict, catalog_search_params: dict, best: dict, judge_relevance_score: float, unique: list[dict], seen: set[str]) -> None:
+        hyde_q = _AgentCore.build_seller_vocabulary_hyde_probe_query(spec)
+        if hyde_q and hyde_q != (catalog_search_params.get('q') or '').lower():
+            verify_params: dict = {'q': hyde_q, 'page': 1}
+            if catalog_search_params.get('price'):
+                verify_params['price'] = catalog_search_params['price']
+            adapt_note = f'reframed using seller-vocabulary phrasing (\'{hyde_q}\') to test whether alternative listing styles surface a stronger candidate the user-vocab query missed'
+        elif catalog_search_params.get('service'):
+            verify_params = {k: v for k, v in catalog_search_params.items() if k != 'service'}
+            verify_params['page'] = 1
+            adapt_note = f"dropped the service filter ('{catalog_search_params.get('service')}') to test breadth"
+        else:
+            q_words = (catalog_search_params.get('q') or '').replace(' only', '').split()
+            if len(q_words) > 2:
+                verify_params = {'q': ' '.join(q_words[:2]), 'page': 1}
+                if catalog_search_params.get('price'):
+                    verify_params['price'] = catalog_search_params['price']
+                adapt_note = f"trimmed keywords from '{catalog_search_params.get('q', '')}' to '{verify_params['q']}' for a broader semantic match"
+            else:
+                verify_params = {**catalog_search_params, 'page': 2}
+                adapt_note = 'advanced to page 2 of the same query (single-token query ? no broader trim available)'
+        rv = _AgentCore.invoke_sandbox_tool_with_gap_and_retry('find_product', verify_params)
+        _AgentCore.merge_find_product_hits_into_candidate_pool(rv, unique, seen)
+        adapted_top = [{'title': r.get('title', ''), 'price': r.get('price'), 'product_id': str(r.get('product_id', '') or '')} for r in (rv or {}).get('result', [])[:3]]
+        new_count = len((rv or {}).get('result', []))
+        think_v = _AgentCore.format_dialogue_step_reasoning_text(ctx.query, {'search_query': verify_params.get('q', ''), 'adaptation': adapt_note, 'phase1_judge_score': judge_relevance_score, 'phase1_pick': {'product_id': str(best.get('product_id', '') or ''), 'title': (best.get('title', '') or '')[:80], 'price': best.get('price')}, 'adapted_top': adapted_top, 'pool_size_after_probe': len(unique)}, fallback=f"Fast-accept pick (pid {best.get('product_id', '')}, score {judge_relevance_score:.1f}). Verification probe: {adapt_note}. Returned {new_count} candidates; top: {adapted_top}. Pool now {len(unique)}.")
+        _AgentCore.append_dialogue_step_with_tool_results(ctx, think_v, [rv])
+
+    @staticmethod
+    def apply_structured_attribute_coverage_gate(spec: dict, best: dict | None, scored_candidates: list[tuple[dict, float]] | None) -> dict | None:
+        constraints = spec.get('constraints') or {}
+        if not (best and isinstance(constraints, dict) and (len(constraints) >= 2) and scored_candidates):
+            return best
+        coverage_probe = _ConstraintCoverageProbe(constraints)
+        best_pid = str(best.get('product_id', '') or '')
+        best_cov = coverage_probe.score_for(best, dialogue_run_state.product_detail_cache.get(best_pid))
+        judge_now = float(best.get('_llm_relevance_score') or 0.0)
+        if judge_now < 8.0 and best_cov < 0.3:
+            challenger: tuple[dict, float, float] | None = None
+            shortlist = list(scored_candidates[:10])
+            cursor = 0
+            while cursor < len(shortlist):
+                cand, sc = shortlist[cursor]
+                cursor += 1
+                cand_pid = str(cand.get('product_id', '') or '')
+                if cand_pid == best_pid or sc < 6.0:
+                    continue
+                cov = coverage_probe.score_for(cand, dialogue_run_state.product_detail_cache.get(cand_pid))
+                if coverage_probe.gap_against(best_cov, cov) < 0.3:
+                    continue
+                if challenger is None or cov > challenger[1] or (cov == challenger[1] and sc > challenger[2]):
+                    challenger = (cand, cov, sc)
+            if challenger is not None:
+                return challenger[0]
+        return best
+
+    @staticmethod
+    def run_single_product_task_branch(ctx, params: dict) -> None:
+        SingleProductRecommendationFlow(ctx, params).execute_recommendation_flow()
+
+    @staticmethod
+    def build_regex_fallback_parameter_snapshot(query: str) -> dict:
+        task_type = _AgentCore.classify_shopping_task_kind_from_query(query)
+        product_text = BUDGET_OR_VOUCHER_MENTION_PATTERN.split(query)[0].strip()
+        if not product_text or len(product_text) < 15:
+            product_text = query
+        parts = [p.strip() for p in MULTI_PRODUCT_CLAUSE_SPLIT_PATTERN.split(product_text) if p and len(p.strip()) > 10]
+        if not parts:
+            parts = [query]
+        products = [_AgentCore.regex_extract_lightweight_product_spec(p) for p in parts]
+        products = [s for s in products if len(s['keywords'].split()) >= 2] or products
+        is_shop = task_type == 'shop' or (task_type == 'voucher' and 'same shop' in query.lower())
+        return {'task_type': task_type, 'products': products, 'is_shop_voucher': is_shop}
+
+    @staticmethod
+    def classify_shopping_task_kind_from_query(query: str) -> str:
+        query_lower = query.lower()
+        voucher_signals = {'voucher', 'budget', 'discount'}
+        if any((sig in query_lower for sig in voucher_signals)):
+            return 'voucher'
+        shop_keywords = re.search('\\b(both|these|offering|offers|sells|same|together|along\\s+with)\\b', query_lower)
+        if 'shop' in query_lower and (shop_keywords is not None or MULTI_PRODUCT_CLAUSE_SPLIT_PATTERN.search(query) is not None):
+            return 'shop'
+        return 'product'
+
+    @staticmethod
+    def extract_keyword_tokens_from_query(text: str) -> list[str]:
+        text_lower = text.lower()
+        alpha_words = [w for w in re.findall('\\b[a-zA-Z]{2,}\\b', text_lower) if w not in QUERY_TOKENIZATION_STOPWORDS]
+        mixed_tokens = re.findall('\\b\\d+[a-zA-Z]+\\b|\\b[a-zA-Z]+\\d+[a-zA-Z]*\\b', text_lower)
+        kw_tokens = alpha_words[:6]
+        for tok in mixed_tokens[:2]:
+            if tok not in kw_tokens:
+                kw_tokens.append(tok)
+        for num_token in re.findall('(\\d+)#', text)[:2]:
+            if num_token not in kw_tokens:
+                kw_tokens.append(num_token)
+        return kw_tokens
+
+    @staticmethod
+    def extract_price_range_phrase_from_query(text: str) -> str | None:
+        if not text or not isinstance(text, str):
+            return None
+        from_to = re.search('(?:priced\\s+)?from\\s+(\\d{1,6})\\s+to\\s+(\\d{1,6})', text, re.I)
+        if from_to:
+            return f'{from_to.group(1)}-{from_to.group(2)}'
+        between_match = re.search('between\\s+(\\d{1,6})\\s+and\\s+(\\d{1,6})', text, re.I)
+        if between_match:
+            return f'{between_match.group(1)}-{between_match.group(2)}'
+        range_match = re.search('(\\d{1,6})\\s*(?:to|and|-)\\s*(\\d{1,6})\\s*(?:pesos|php)', text, re.I)
+        if range_match:
+            return f'{range_match.group(1)}-{range_match.group(2)}'
+        min_match = re.search('(?:greater|more|over|above|at\\s+least|minimum|min\\.?|>)\\s*(?:than\\s*)?(\\d{1,6})', text, re.I)
+        if min_match:
+            return f'{min_match.group(1)}-'
+        max_match = re.search('(?:less|under|below|at\\s+most|maximum|max\\.?|<)\\s*(?:than\\s*)?(\\d{1,6})', text, re.I)
+        if max_match:
+            return f'-{max_match.group(1)}'
+        if re.search('(?:price|pesos|php|cost)', text, re.I):
+            range_match2 = re.search('(\\d{1,6})\\s+(?:to|and)\\s+(\\d{1,6})', text)
+            if range_match2:
+                return f'{range_match2.group(1)}-{range_match2.group(2)}'
+        return None
+
+    @staticmethod
+    def extract_service_tags_csv_from_query(text_lower: str) -> str | None:
+        svc_parts: list[str] = []
+        service_signals = [('official', ('lazmall', 'official')), ('freeShipping', ('free shipping', 'free delivery')), ('flashsale', ('lazflash', 'flash sale', 'flashsale')), ('COD', ('cash on delivery', 'cod'))]
+        for svc_name, markers in service_signals:
+            if any((marker in text_lower for marker in markers)):
+                svc_parts.append(svc_name)
+        return ','.join(svc_parts) if svc_parts else None
+
+    @staticmethod
+    def regex_extract_lightweight_product_spec(text: str) -> dict:
+        text_lower = text.lower()
+        kw_tokens = _AgentCore.extract_keyword_tokens_from_query(text)
+        keywords = ' '.join(kw_tokens) or 'product'
+        return {'keywords': keywords, 'price_range': _AgentCore.extract_price_range_phrase_from_query(text), 'service': _AgentCore.extract_service_tags_csv_from_query(text_lower)}
+
+    @staticmethod
+    def append_dialogue_step_with_tool_results(ctx, think: str, tool_results: list, response: str='') -> None:
+        compact = [_AgentCore.compact_find_product_tool_result_for_trace(tc) for tc in tool_results or []]
+        ctx.steps.append(create_dialogue_step(think, compact, response, ctx.query, len(ctx.steps) + 1))
+
+    @staticmethod
+    def finalize_dialogue_with_product_recommendation(ctx, product_ids: list, status: str, think: str='', llm_reason: str='') -> None:
+        fmt_ids = _AgentCore.join_product_ids_as_csv_ordered(product_ids)
+        qprev = str(getattr(ctx, 'query', '') or '')[:240]
+        rec = _AgentCore.invoke_sandbox_tool_with_gap_and_retry('recommend_product', {'product_ids': fmt_ids})
+        term = _AgentCore.invoke_sandbox_tool_with_gap_and_retry('terminate', {'status': status})
+        if not think:
+            reason_part = f'{llm_reason} ' if llm_reason else ''
+            fb = f'I am recommending product(s) {fmt_ids} for the query. {reason_part}Status: {status}.'
+            narrate_ctx: dict = {'recommended_product_ids': fmt_ids, 'status': status, 'note': 'Finalising recommendation and terminating the session.'}
+            if llm_reason:
+                narrate_ctx['llm_reason'] = llm_reason
+            think = _AgentCore.format_dialogue_step_reasoning_text(ctx.query, narrate_ctx, fallback=fb, force=True)
+        _AgentCore.append_dialogue_step_with_tool_results(ctx, think, [rec, term], 'Done.')
+
+    @staticmethod
+    def append_single_product_alternatives_weighing_step(ctx, leader: dict | None, pool: list, spec: dict | None, n_alts: int=3) -> None:
+        if not leader or not pool:
+            return
+        lead_pid = str(leader.get('product_id', ''))
+        lead_heur = _AgentCore.safe_rounded_heuristic_score_or_none(leader, ctx.query, spec)
+        others = [p for p in pool if str(p.get('product_id', '')) != lead_pid]
+        try:
+            others = sorted(others, key=lambda p: _AgentCore.composite_listing_relevance_with_spec_penalties(p, ctx.query, parsed_spec=spec), reverse=True)
+        except Exception:
+            pass
+        alts = [{'product_id': str(a.get('product_id', '')), 'title': (a.get('title') or '')[:80], 'price': a.get('price'), 'heuristic_score': _AgentCore.safe_rounded_heuristic_score_or_none(a, ctx.query, spec)} for a in others[:n_alts]]
+        step_data = {'weighing': {'leader': {'product_id': lead_pid, 'title': (leader.get('title') or '')[:80], 'price': leader.get('price'), 'heuristic_score': lead_heur, 'llm_reason': leader.get('_llm_reason', ''), 'relevance_score': leader.get('_llm_relevance_score', 0)}, 'alternatives': alts}, 'query_constraints': {'keywords': (spec or {}).get('keywords'), 'price_range': (spec or {}).get('price_range'), 'service': (spec or {}).get('service')}}
+        alts_fmt = ', '.join((f"pid={a['product_id']} price={a['price']} score={a['heuristic_score']}" for a in alts)) or 'none'
+        seen_ids = {str(p.get('product_id', '') or '') for p in pool}
+        top_alt = _AgentCore.out_of_pool_comparison_alt(leader, spec, ctx.query, seen_ids) or (alts[0] if alts else None)
+        prefer = ''
+        if top_alt:
+            prefer = f" I prefer pid={lead_pid} (price={leader.get('price')}, score={lead_heur}) OVER pid={top_alt['product_id']} (price={top_alt['price']}, score={top_alt['heuristic_score']}) because the leader has higher heuristic score and tighter alignment with the parsed query."
+        fb = f"I am weighing the top candidates. The current leader is product_id={lead_pid}, price={leader.get('price')}, heuristic_score={lead_heur}. LLM reason: {leader.get('_llm_reason', '')}. Alternatives considered: {alts_fmt}.{prefer}"
+        _AgentCore.append_dialogue_step_with_tool_results(ctx, _AgentCore.format_dialogue_step_reasoning_text(ctx.query, step_data, fallback=fb), [])
+
+    @staticmethod
+    def execute_shopping_dialogue_pipeline(ctx: 'DialogueRunContext', problem_data: dict) -> list[dict]:
+        dialogue_run_state.reset_for_run()
+        _AgentCore.clear_thread_local_http_journal()
+        ctx.steps = []
+        ctx.query = problem_data.get('query', '')
+        metrics_observer = getattr(ctx, 'metrics', None)
+        with _DialoguePhaseTimer('pipeline.parse_and_dispatch') as parse_timer:
+            try:
+                _AgentCore.execute_product_dialogue_from_parsed_parameters(ctx)
+            except Exception:
+                try:
+                    _AgentCore.finalize_dialogue_with_product_recommendation(ctx, [NO_MATCH_PRODUCT_ID_SENTINEL], 'failure')
+                except Exception:
+                    ctx.steps.append(create_dialogue_step('Done.', [], 'Done.', ctx.query, len(ctx.steps) + 1))
+        if isinstance(metrics_observer, _DialogueRunMetricsObserver):
+            metrics_observer.record(parse_timer)
+        if not ctx.steps:
+            ctx.steps.append(create_dialogue_step('Done.', [], 'Done.', ctx.query, 1))
+        _AgentCore.merge_http_journal_into_first_dialogue_step(ctx.steps)
+        return ctx.steps
+
+    @staticmethod
+    def execute_product_dialogue_from_parsed_parameters(ctx: 'DialogueRunContext') -> None:
+        params = _AgentCore.llm_parse_full_shopping_parameters(ctx.query, 'product')
+        products_info = params.get('products', [])
+        keyword_list = [e.get('keywords') or e.get('q', '') for e in products_info]
+        price_list = [e.get('price_range') for e in products_info]
+        service_list = [e.get('service') for e in products_info]
+        init_fallback = _AgentCore.build_task_intro_narration_fallback('product', ctx, keyword_list, price_list, service_list)
+        init_ctx: dict = {'keywords': keyword_list, 'price_constraints': price_list, 'service_filters': service_list}
+        if products_info and bool(products_info[0].get('only_product_type')):
+            init_ctx['only_product_type'] = True
+            init_ctx['only_product_type_reason'] = ONLY_PRODUCT_TYPE_SEARCH_NOTE
+        _AgentCore.append_dialogue_step_with_tool_results(ctx, _AgentCore.format_dialogue_step_reasoning_text(ctx.query, init_ctx, fallback=init_fallback), [])
+        _AgentCore.run_single_product_task_branch(ctx, params)
+
+
+def product_agent_main(problem_data: dict) -> list[dict]:
+    """Entry point for the single-product task, forced to the product branch.
+
+    Mirrors `_AgentCore.execute_shopping_dialogue_pipeline` but always parses and
+    dispatches as a product request (the caller in agent.py has already routed
+    this query to the product path)."""
+    ctx = DialogueRunContext()
+    return _AgentCore.execute_shopping_dialogue_pipeline(ctx, problem_data or {})
