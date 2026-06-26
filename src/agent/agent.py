@@ -6526,8 +6526,11 @@ class _AgentCore:
             result = journaling_llm_inference_proxy_client.post('/inference/chat/completions', json_data={'model': model, 'temperature': 0, 'stream': False, 'messages': [{'role': 'system', 'content': sys_prompt}, {'role': 'user', 'content': user_message}]})
             parsed = _AgentCore.parse_llm_parameter_json_or_none(result, task_type)
             if parsed is not None:
+                _record_parse(task_type, 'llm', model)
                 return parsed
             msg = 'returned unparseable response' if result and result.get('choices') else 'returned no response'
+        LOGGER.warning('LLM param parse failed (task=%s); using regex fallback for query=%r', task_type, str(query)[:160])
+        _record_parse(task_type, 'regex')
         return _AgentCore.build_regex_fallback_parameter_snapshot(query)
 
     @staticmethod
