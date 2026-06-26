@@ -3004,6 +3004,25 @@ def _voucher_spec_candidates(spec: dict, query: str) -> tuple[list[ListingRow], 
         _consume(sp_no_price)
     return rows, calls
 
+def _merge_ranked_by_pid(primary: list[dict], secondary: list[dict]) -> list[dict]:
+    """Round-robin interleave two ranked candidate lists, deduped by product_id.
+
+    `_elect_best` only inspects its first `max_candidates` candidates, so when the
+    two rankers disagree (search-server relevance order vs `_score_listings`),
+    trusting either alone can bury the ground-truth product past the cut and the
+    judge never sees it. Interleaving keeps the head of *both* rankings near the
+    front, so a GT that either ranker favours survives into the slice."""
+    seen: set[str] = set()
+    merged: list[dict] = []
+    for row in [x for pair in zip(primary, secondary) for x in pair] + primary[len(secondary):] + secondary[len(primary):]:
+        pid = str(row.get('product_id', '')).strip()
+        if pid and pid in seen:
+            continue
+        if pid:
+            seen.add(pid)
+        merged.append(row)
+    return merged
+
 def _voucher_rank_pool(spec: dict, rows: list[ListingRow], query: str) -> tuple[dict, dict]:
     """Score a spec's candidates by relevance and return (swap-ready pool, best pick).
 
@@ -3023,10 +3042,13 @@ def _voucher_rank_pool(spec: dict, rows: list[ListingRow], query: str) -> tuple[
         score_by_pid[str(prod.get('product_id', '')).strip()] = float(sc)
     filtered = [(p, s) for p, s in scored_pairs if s >= VOUCHER_SCORE_FLOOR]
     pool = {'scored': scored_pairs, 'filtered': filtered, 'raw': [dict(x) for x in rows]}
-    # Elect over the score-ranked shortlist, not raw search order: `_elect_best`
-    # only inspects its first N candidates, so a GT that the batch scorer ranks
-    # highly but that sits deep in raw search order would otherwise be cut.
-    shortlist = [row for row, _ in sorted(scored_pairs, key=lambda kv: kv[1], reverse=True)] or rows
+    # Elect over a merge of both rankings, not either alone: `_elect_best` only
+    # inspects its first N candidates. Score-sorting alone surfaces a GT the batch
+    # scorer ranks highly but raw order buries — yet it also buries a GT the search
+    # server ranks highly when `_score_listings` is noisy. Interleaving the two
+    # keeps the head of both rankings in the slice the judge sees.
+    score_sorted = [row for row, _ in sorted(scored_pairs, key=lambda kv: kv[1], reverse=True)]
+    shortlist = _merge_ranked_by_pid(score_sorted, list(rows)) or rows
     best = _elect_best(q, shortlist, details, only_product_type=only_pt)
     if best is None:
         best = dict(max(scored_pairs, key=lambda kv: kv[1])[0]) if scored_pairs else dict(rows[0])
