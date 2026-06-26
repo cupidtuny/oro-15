@@ -6514,7 +6514,7 @@ class _AgentCore:
     @staticmethod
     def llm_parse_full_shopping_parameters(query: str, task_type: str) -> dict:
         sys_prompt = LLM_PARSE_PROMPT_BY_TASK_KIND.get(task_type, LLM_PROMPT_PARSE_SINGLE_PRODUCT)
-        base_model = LLM_PARSE_MODEL_BY_TASK_KIND.get(task_type, INFERENCE_MODEL_REGISTRY['VOUCHER_PARSE_MODEL'])
+        base_model = LLM_PARSE_MODEL_BY_TASK_KIND.get(task_type, INFERENCE_MODEL_REGISTRY['PRODUCT_PARSE_MODEL'])
         user_message = _AgentCore.format_llm_parse_user_message(query)
         for model in _AgentCore.llm_model_ids_with_role_fallback(base_model):
             result = journaling_llm_inference_proxy_client.post('/inference/chat/completions', json_data={'model': model, 'temperature': 0, 'stream': False, 'messages': [{'role': 'system', 'content': sys_prompt}, {'role': 'user', 'content': user_message}]})
