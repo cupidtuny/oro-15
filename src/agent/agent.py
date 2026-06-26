@@ -1924,6 +1924,37 @@ def _re_spec(text: str) -> dict:
     keywords = ' '.join(kw_tokens) or 'product'
     return {'keywords': keywords, 'price_range': _extract_price_range(text), 'service': _extract_service_flags(text_lower)}
 
+def _regex_voucher_block(query: str) -> dict | None:
+    """Parse the voucher rules straight from the query text.
+
+    Used when the LLM parameter parse fails: without a voucher block the voucher
+    flow can't compute `allowed_total` and would fail the problem outright. The
+    suite phrasing is consistent ("budget is only `N`", "exceeds `N`",
+    "percentage discount of `N%` with a cap of `N`", "fixed discount of `N`")."""
+    text = query
+    budget = re.search(r'budget\s+is\s+only\s+`?(\d+(?:\.\d+)?)', text, re.I)
+    if not budget:
+        return None
+    threshold = re.search(r'(?:exceeds|exceed|more than|over|above|minimum (?:spend|of))\s+`?(\d+(?:\.\d+)?)', text, re.I)
+    pct = re.search(r'percentage\s+discount\s+of\s+`?(\d+(?:\.\d+)?)\s*%', text, re.I)
+    cap = re.search(r'cap\s+of\s+`?(\d+(?:\.\d+)?)', text, re.I)
+    fixed = re.search(r'fixed\s+discount\s+of\s+`?(\d+(?:\.\d+)?)', text, re.I)
+    same_shop = 'same shop' in text.lower()
+    if pct:
+        discount_type, discount_value = 'percentage', float(pct.group(1))
+    elif fixed:
+        discount_type, discount_value = 'fixed', float(fixed.group(1))
+    else:
+        return None
+    return {
+        'voucher_type': 'shop' if same_shop else 'platform',
+        'discount_type': discount_type,
+        'discount_value': discount_value,
+        'threshold': float(threshold.group(1)) if threshold else 0.0,
+        'cap': float(cap.group(1)) if cap and discount_type == 'percentage' else 0.0,
+        'budget': float(budget.group(1)),
+    }
+
 def _regex_param_snapshot(query: str) -> dict:
     task_type = _route_task_kind(query)
     product_text = _RX_BUDGET_ANCHOR.split(query)[0].strip()
@@ -1935,7 +1966,13 @@ def _regex_param_snapshot(query: str) -> dict:
     products = [_re_spec(p) for p in parts]
     products = [s for s in products if len(s['keywords'].split()) >= 2] or products
     is_shop = task_type == 'shop' or (task_type == 'voucher' and 'same shop' in query.lower())
-    return {'task_type': task_type, 'products': products, 'is_shop_voucher': is_shop}
+    snapshot: dict = {'task_type': task_type, 'products': products, 'is_shop_voucher': is_shop}
+    if task_type == 'voucher':
+        voucher_block = _regex_voucher_block(query)
+        if voucher_block is not None:
+            snapshot['voucher'] = voucher_block
+            snapshot['is_shop_voucher'] = is_shop or voucher_block.get('voucher_type') == 'shop'
+    return snapshot
 
 def _clean_shop_keywords(parsed: dict) -> dict:
     for prod in parsed.get('products', []):
@@ -2934,7 +2971,12 @@ def _voucher_spec_candidates(spec: dict, query: str) -> tuple[list[ListingRow], 
     """Relevance-first per-spec retrieval: search the spec's own keywords (and its
     stated price range, if any) over pages 1-2. No voucher price band is applied -
     the ground-truth products already fit the budget, so constraining the search by
-    budget only risks surfacing a cheaper, less relevant product."""
+    budget only risks surfacing a cheaper, less relevant product.
+
+    Coverage matters: logs show the GT product is sometimes absent from the
+    keyword search alone, so when the parse gives an exact `query` slice that
+    differs from the compressed keywords, probe it too - different phrasing
+    surfaces listings the keyword compression drops."""
     sp = _spec_to_query(spec, include_price=True)
     rows: list[ListingRow] = []
     seen: set[str] = set()
@@ -2951,6 +2993,11 @@ def _voucher_spec_candidates(spec: dict, query: str) -> tuple[list[ListingRow], 
                     rows.append(row)
 
     _consume(sp)
+    slice_q = str(spec.get('query') or '').strip()
+    if slice_q and slice_q.lower() != str(sp.get('q', '')).strip().lower():
+        slice_params = dict(sp)
+        slice_params['q'] = slice_q
+        _consume(slice_params)
     if not rows and sp.get('price'):
         # A stated price band can be mis-parsed or too tight; retry unconstrained.
         sp_no_price = {k: v for k, v in sp.items() if k != 'price'}
@@ -2976,7 +3023,11 @@ def _voucher_rank_pool(spec: dict, rows: list[ListingRow], query: str) -> tuple[
         score_by_pid[str(prod.get('product_id', '')).strip()] = float(sc)
     filtered = [(p, s) for p, s in scored_pairs if s >= VOUCHER_SCORE_FLOOR]
     pool = {'scored': scored_pairs, 'filtered': filtered, 'raw': [dict(x) for x in rows]}
-    best = _elect_best(q, rows, details, only_product_type=only_pt)
+    # Elect over the score-ranked shortlist, not raw search order: `_elect_best`
+    # only inspects its first N candidates, so a GT that the batch scorer ranks
+    # highly but that sits deep in raw search order would otherwise be cut.
+    shortlist = [row for row, _ in sorted(scored_pairs, key=lambda kv: kv[1], reverse=True)] or rows
+    best = _elect_best(q, shortlist, details, only_product_type=only_pt)
     if best is None:
         best = dict(max(scored_pairs, key=lambda kv: kv[1])[0]) if scored_pairs else dict(rows[0])
     bpid = str(best.get('product_id', '')).strip()
