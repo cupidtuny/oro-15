@@ -405,7 +405,12 @@ class _TracedProxy:
 
     def get(self, path: str, params=None, **kw):
         return self._roundtrip('GET', path, params=params, **kw)
-_llm_transport = _TracedProxy(ProxyClient(timeout=120, max_retries=5), 'inference')
+# timeout/max_retries are bounded against the 300s per-problem sandbox kill: a hung
+# provider at the old 120s*5 (~640s) guaranteed a kill (0 on every metric), whereas
+# `post` returns None on exhaustion so the agent can fall through to a best-effort
+# finalize. 75s*3 (~245s worst case) leaves headroom to finalize; normal inference
+# calls return in <10s so this never truncates a healthy call.
+_llm_transport = _TracedProxy(ProxyClient(timeout=75, max_retries=3), 'inference')
 _search_transport = _TracedProxy(ProxyClient(timeout=30, max_retries=3), 'search')
 
 def _rate_limited_search_get(path: str, params: dict | None=None):
