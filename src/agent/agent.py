@@ -4664,7 +4664,7 @@ def agent_main(problem_data: dict) -> list[dict]:
     query = problem_data.get('query', '') if isinstance(problem_data, dict) else ''
     task = _route_task_kind(query)
     pid = (problem_data.get('problem_id') or problem_data.get('id')) if isinstance(problem_data, dict) else None
-    LOGGER.info('agent_main start problem_id=%s task=%s query=%r', pid, task, str(query)[:160])
+    LOGGER.info('agent_main start ================== problem_id=%s task=%s query=%r', pid, task, str(query)[:160])
     try:
         if task == 'product':
             try:
