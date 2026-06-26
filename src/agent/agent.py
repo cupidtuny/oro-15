@@ -1999,6 +1999,59 @@ def _parse_llm_params_response(result: dict, task_type: str) -> dict | None:
 _PARSE_PROMPT_MAP: dict[str, str] = {'product': RazgrizPrompts.PARSE_PRODUCT, 'shop': RazgrizPrompts.PARSE_SHOP, 'voucher': RazgrizPrompts.PARSE_VOUCHER}
 _PARSE_MODEL_MAP: dict[str, str] = {'product': PRODUCT_PARSE_, 'shop': SHOP_PARSE_, 'voucher': VOUCHER_PARSE_}
 
+# Per-process parse-source tally. Each problem runs in its own sandbox process, so
+# this is usually one entry; the per-parse PARSE_RESULT line below is the durable
+# signal - grep it across logs to get the LLM-vs-regex fallback rate per task.
+_PARSE_STATS: dict[str, dict[str, int]] = {}
+
+def _record_parse(task_type: str, source: str, model: str | None = None) -> None:
+    """Emit one greppable line per parse and tally the source.
+
+    `source` is 'llm' (LLM parse accepted) or 'regex' (fell back). Count
+    `source=regex` vs `source=llm` across a run to see the fallback rate:
+        grep -oE 'PARSE_RESULT task=\\w+ source=\\w+' logs/*.log | sort | uniq -c
+    """
+    bucket = _PARSE_STATS.setdefault(task_type, {'llm': 0, 'regex': 0})
+    bucket[source] = bucket.get(source, 0) + 1
+    LOGGER.info('PARSE_RESULT task=%s source=%s model=%s', task_type, source, model or '-')
+
+def _reconcile_voucher_block(parsed: dict, query: str) -> dict:
+    """Validate/repair the LLM voucher block against a deterministic regex read.
+
+    The suite phrases voucher numbers very consistently ("budget is only `N`",
+    "fixed discount of `N`", "cap of `N`"), so regex is a reliable source of truth
+    for the math. We keep the LLM's product specs but backfill any missing or
+    non-positive numeric field from regex - one fumbled/omitted number otherwise
+    makes `_voucher_ceiling` return None and fails the whole voucher problem.
+
+    Conservative on purpose: we only fill a field the LLM left empty/zero, never
+    overwrite a value the LLM did provide (the threshold regex can over-match a
+    stray "above N" in a product description, so an LLM-provided value wins)."""
+    rx = _regex_voucher_block(query)
+    if rx is None:
+        return parsed
+    v = parsed.get('voucher')
+    if not isinstance(v, dict):
+        parsed['voucher'] = dict(rx)
+        return parsed
+
+    def _num(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+    if _num(v.get('budget')) in (None, 0.0) and rx.get('budget'):
+        v['budget'] = rx['budget']
+    if not v.get('discount_type') and rx.get('discount_type'):
+        v['discount_type'] = rx['discount_type']
+    if _num(v.get('discount_value')) in (None, 0.0) and rx.get('discount_value'):
+        v['discount_value'] = rx['discount_value']
+    if _num(v.get('cap')) in (None, 0.0) and rx.get('cap'):
+        v['cap'] = rx['cap']
+    if 'threshold' not in v and rx.get('threshold') is not None:
+        v['threshold'] = rx['threshold']
+    return parsed
+
 def _llm_param_snapshot(query: str, task_type: str) -> dict:
     sys_prompt = _PARSE_PROMPT_MAP.get(task_type, RazgrizPrompts.PARSE_PRODUCT)
     base_model = _PARSE_MODEL_MAP.get(task_type, VOUCHER_PARSE_)
@@ -2006,9 +2059,13 @@ def _llm_param_snapshot(query: str, task_type: str) -> dict:
         result = _llm_transport.post('/inference/chat/completions', json_data={'model': model, 'temperature': 0, 'stream': False, 'messages': [{'role': 'system', 'content': sys_prompt}, {'role': 'user', 'content': query}]})
         parsed = _parse_llm_params_response(result, task_type)
         if parsed is not None:
+            if task_type == 'voucher':
+                parsed = _reconcile_voucher_block(parsed, query)
+            _record_parse(task_type, 'llm', model)
             return parsed
         LOGGER.debug('parse model %s: %s', model, 'unparseable response' if result and result.get('choices') else 'no response')
     LOGGER.warning('LLM param parse failed (task=%s); using regex fallback for query=%r', task_type, str(query)[:160])
+    _record_parse(task_type, 'regex')
     return _regex_param_snapshot(query)
 
 class _ShopResult(_NamedTuple):
